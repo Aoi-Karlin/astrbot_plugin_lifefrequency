@@ -51,6 +51,7 @@ from .core import life_factors as F
 from .core import life_gate as G
 from .core import life_memory as M
 from .core import life_proactive as P
+from .core import life_proactive_test as PT
 from .core import life_sim as S
 from .core import render as R
 
@@ -1206,6 +1207,118 @@ class LifeFrequencyPlugin(Star):
             f"已重置：当前活动 {R.activity_label(self.state.activity)}，"
             f"情绪 {self.state.emotion:.1f}/10，体力 {self.state.energy:.1f}/10。",
         )
+
+    @life.command("测试主动")
+    async def life_test_proactive(self, event: AstrMessageEvent):
+        """人为触发一次主动开口，用来验证配置是否有效。
+
+        与自动触发的唯一区别是**跳过判定**：不看时段、不看配额、不看评分，
+        直接按真实状态、真实素材、真实人设走同一条发送链路。因此能准确回答
+        「配置通不通」这个问题，也不改动任何状态（不记次数、不推进生活）。
+
+        Args:
+            event: 消息事件。
+        """
+        if not self._is_admin(event):
+            yield event.plain_result("只有管理员能触发主动开口测试。")
+            return
+
+        now = _now()
+        umo = self._safe_umo(event)
+        if not umo:
+            yield event.plain_result("拿不到当前会话标识，无法测试。")
+            return
+
+        config = self.proactive_config
+        # 用副本算，避免任何写回
+        session = dict(self._sessions().get(umo) or {})
+        materials = S.active_materials(
+            self.state,
+            now,
+            floor=CA.num(CA.section(self.conf, "events"), "material_decay_floor", 0.25),
+        )
+        local_now = S.local_datetime(now, self.sim_config.tz_offset_minutes)
+        day_key = S.day_key_of(local_now, self.sim_config.day_boundary_hour)
+
+        decision = P.decide(
+            config=config,
+            now=now,
+            now_minutes=local_now.hour * 60 + local_now.minute,
+            activity=self.state.activity,
+            energy=float(self.state.energy),
+            emotion=float(self.state.emotion),
+            materials=materials,
+            session=session,
+            day_key=day_key,
+            private_chat=event.is_private_chat(),
+        )
+
+        # 判定结果照常算出来给用户看，但**不拿它当门槛**：测试的目的就是
+        # 「在它本来不会开口的时候，看看配置到底长什么样」。
+        #
+        # ⚠ 素材必须由这里自己选：``decide`` 一旦在早期闸（总开关、睡觉）短路，
+        # ``decision.material`` 就是 ``None``。若直接沿用，总开关关闭时就永远
+        # 测不出东西——而那恰恰是最该测的情况。
+        material = decision.material or P.select_material(
+            materials, now, floor=config.material_decay_floor
+        )
+        forced = P.ProactiveDecision(
+            True,
+            decision.reason,
+            score=decision.score,
+            material=material,
+            intent=decision.intent or "主动关心一下",
+            detail=decision.detail,
+        )
+        header = self._test_decision_header(config, decision, materials)
+
+        if forced.material is None:
+            # 连素材都没有：没有任何话可说，如实告知而不是编一句
+            yield event.plain_result(
+                header + "\n\n❌ 现在一条没过期的素材都没有，没法生成内容。\n"
+                "请检查「随机事件与素材」的有效期与衰减设置。"
+            )
+            return
+
+        ok = await self._send_proactive(umo, forced, now)
+        if ok:
+            logger.info(f"[{PLUGIN_NAME}] 手动触发主动开口成功（{umo}）")
+            yield event.plain_result(header + "\n\n✅ 已按自动触发的方式发出，请查看上面的消息。")
+        else:
+            yield event.plain_result(
+                header
+                + "\n\n❌ 发送失败：多半是没有可用的对话模型（检查是否配置了默认模型）。详情见日志。"
+            )
+
+    def _test_decision_header(
+        self,
+        config: P.ProactiveConfig,
+        decision: P.ProactiveDecision,
+        materials: Sequence[Mapping[str, Any]],
+    ) -> str:
+        """测试消息的抬头：说清楚「自动触发的话会不会开口」，以及为什么。"""
+
+        if decision.should_send:
+            auto = "自动触发的话，现在**会**开口。"
+        else:
+            auto = f"自动触发的话，现在**不会**开口（{decision.reason_label}）。"
+        lines = [
+            "🧪 主动开口测试（手动触发，已跳过判定）",
+            "",
+            auto,
+        ]
+        if not config.enabled:
+            lines.append("⚠ 主动开口总开关是关的——真实情况下永远不会自动开口。")
+        if self.dry_run:
+            lines.append("⚠ 当前是演算模式（dry_run），自动触发也不会真的发。")
+        if decision.reason_label and not decision.should_send:
+            if decision.detail:
+                lines.append(f"　原因：{decision.reason_label}（{decision.detail}）")
+            hint = PT.FIX_HINTS.get(decision.reason, "")
+            if hint:
+                lines.append(f"　怎么办：{hint}")
+        lines.append(f"　可用素材：{len(materials)} 条；评分 {decision.score:.3f} / 阈值 {config.score_threshold:.3f}")
+        return "\n".join(lines)
 
     def _scope_hit_count(self, sec: Mapping[str, Any]) -> int:
         """统计**实际命中**了 ``target_chats`` 的会话数（给状态卡用）。
