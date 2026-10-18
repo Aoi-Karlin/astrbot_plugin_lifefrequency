@@ -268,9 +268,9 @@
       "provider_id": {
         "description": "活动决策模型",
         "type": "string",
-        "default": "",
         "_special": "select_provider",
-        "hint": "留空时用当前会话的聊天模型。建议选便宜的小模型。"
+        "default": "",
+        "hint": "从下拉框里选一个已配置的模型。留空则自动使用机器人当前会话所用的模型。"
       },
       "temperature": {
         "description": "温度",
@@ -961,6 +961,13 @@
         "description": "启用主动开口",
         "type": "bool",
         "default": false
+      },
+      "provider_id": {
+        "description": "主动开口模型",
+        "type": "string",
+        "_special": "select_provider",
+        "default": "",
+        "hint": "主动开口时用哪个模型润色。留空则跟随活动决策模型 / 当前会话模型。"
       },
       "score_threshold": {
         "description": "开口分数阈值",
