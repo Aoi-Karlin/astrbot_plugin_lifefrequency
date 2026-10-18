@@ -1,0 +1,291 @@
+# 生活频率 · AstrBot 版
+
+让机器人有一份**持续的小生活**：她会按时段和心情决定自己在做什么（上班、打游戏、
+看番、发呆、睡觉……），会有情绪、体力、睡眠欠账，甚至会感冒；而她回不回群里的
+闲话、会不会主动开口，都由这份生活状态决定。
+
+> 移植自 MaiBot 插件 [orge-8/life-frequency](https://github.com/orge-8/life-frequency)，
+> 保留原版全部行为语义与配置项，改用 AstrBot 的事件管线与数据存储实现。原作者
+> **orge-8**，MIT 协议（见 `LICENSE`）。
+
+---
+
+## 快速开始
+
+1. 把整个 `astrbot_plugin_lifefrequency` 文件夹放进 `data/plugins/`；
+2. 重启 AstrBot（或在 WebUI 里重载插件）；
+3. 打开「插件配置」→「生活频率」，至少配两样：
+   - **经济 / 模型**：`activity_llm.provider_id` 选一个对话模型（不选就用全局默认）；
+   - **人设 / 名字**：`persona.text` 留空则自动用 AstrBot 的默认人格。
+4. 群聊里发 `/生活 状态` 看看她此刻在干嘛。
+
+不需要任何额外依赖：`requirements.txt` 里没有第三方包，用的都是 AstrBot 自带的。
+
+---
+
+## 她是怎么"活"的
+
+后台每 `tick_seconds`（默认 600 秒 = 10 分钟）推进一次，顺序固定：
+
+```
+结算（体力/情绪/作息/生病/日期/事件）
+  → 问模型「你现在在做什么」
+  → 强制层收口（该睡觉就睡、睡太久就醒、生病就休息）
+  → 模型长期不交作业？按时段表重新取种子
+  → 刷新经济快照
+  → 判断要不要主动开口
+  → 落盘
+```
+
+**问模型这一步是可省的**：如果强制层已经决定了结果（比如现在就是睡眠时段），
+`skip_when_forced` 会直接跳过，不浪费 token。模型连续失败 `fail_streak_limit`
+次后进入 `cooldown_minutes` 冷却，期间保持上个活动——生活不会因为模型挂了而停摆。
+
+活动集合（与 MaiBot 版一致）：
+
+`sleep` `sick_rest` `daily` `game` `anime` `music` `work` `meeting` `overtime`
+`commute` `lunch` `off_work` `night_study` `daze` `before_sleep`
+
+---
+
+## 回复闸门（这是 AstrBot 版的核心差异）
+
+MaiBot 有 `frequency.set_adjust` 这种硬旋钮，能直接改宿主的回复频率；**AstrBot
+没有这一层**。所以本插件自己挂一个优先级最高（`priority=100`）的 handler，把每条
+群聊纯闲聊都过一遍闸门，决定要不要放行给默认 LLM。
+
+### 永远不会被拦的消息
+
+| 类型 | 说明 |
+| --- | --- |
+| `@` 她 / 唤醒前缀 | 判定顺序在宿主那边，插件不参与 |
+| 私聊 | 一对一的对话永远回 |
+| **任何其它插件的指令** | handler 发现有别的插件要吃这条消息就直接放行 |
+| 她自己的 `/生活 ...` | 同上 |
+| `gate.enabled=false` / `simulation.dry_run=true` | 整个闸门关闭 |
+
+> 这一条特别重要：闸门只敢「放行」或「拦下纯闲聊」，绝不对别的插件的消息调用
+> `stop_event()`。否则装了这个插件以后，别的插件的指令会开始随机失灵。
+
+### 两种闸门模式
+
+**`count`（默认，计数门）** —— 攒够 N 条闲话才回一次：
+
+```
+N = max(1, ceil(base_talk_value / (基础频率 × 倍率)))
+```
+
+倍率越低，需要的条数越多；倍率为 0 时是**硬静默**（一条都不回，直到生活状态变化）。
+另外还有 `min_reply_interval_seconds` 兜底，避免刚回完又回。
+
+**`probability`（概率门）** —— 每句话按概率掷骰：
+
+```
+P = base_probability × (基础频率 × 倍率)
+```
+
+### 倍率是怎么算出来的
+
+`frequency_card`（`/生活 频率`）会逐项列出来。参与计算的因子：
+
+- **活动**（睡觉时接近 0，打游戏时偏低，发呆时中等……见 `frequency.activity_factors`）
+- **情绪**（0–10，低于基线会压低频率）
+- **体力**（越低越不想说话）
+- **生病**（感冒期间整体压低）
+- **睡眠欠账**（连续熬夜会持续压制）
+- **日期**（生日、节日的倍率来自 `date.*`）
+- **素材**（攒了几条想主动说的念头，会小幅抬高）
+- **静默时段**（`frequency.quiet_hours`，默认深夜 23:30–08:00）
+
+最后夹到 `[min_adjust, max_adjust]` 之间，再兜一个 `silence_floor`。
+
+### 只让指定群生效：白名单 / 黑名单
+
+闸门和主动开口各有一份**独立的**范围设置（`gate` 和 `proactive` 两个分组下的
+`filter_mode` + `target_chats`）：
+
+| `filter_mode` | 含义 |
+| --- | --- |
+| `all`（默认） | 全部会话都生效 |
+| `whitelist` | **只有**名单里的群受她作息影响，其它群正常回复 |
+| `blacklist` | 名单里的群**不受**影响，其它群正常 |
+
+`target_chats` 一行一个，**直接填群号**就行：
+
+```
+123456789
+987654321
+```
+
+也支持 `group:123456789` 和完整 umo（`aiocqhttp:GroupMessage:123456789`）。
+带 `group:` / `private:` 前缀的写法能区分同号的群与私聊——QQ 的群号和 QQ 号
+在同一命名空间，裸群号 `123456789` 会同时命中同号的私聊。
+
+几个要留意的点：
+
+- **白名单为空 = 谁都不生效**（不是"全部生效"）。配成这样就等于闸门没开，
+  启动日志会明确告警；`/生活 状态` 里也会显示「命中 0 个会话 ⚠」。
+- **黑名单为空 = 全部生效**，与 `all` 等价，同样会告警。
+- **私聊永不受名单限制**（本来就永不拦截）。
+- 群号带话题后缀也能匹配：Telegram 的 `-100123#45` 填 `-100123` 就能命中。
+- 想确认填得对不对，发 `/生活 状态` 看「生效范围」那一行。
+
+---
+
+## 指令
+
+| 指令 | 作用 |
+| --- | --- |
+| `/生活 状态` | 状态卡：在做什么、情绪体力、倍率、经济 |
+| `/生活 频率` | 逐项拆解倍率，以及在闸门下的真实后果 |
+| `/生活 活动` | 当前活动、来源、停留期、模型健康状况 |
+| `/生活 为什么` | 沉默台账：她最近为什么没说话（按原因分类计数） |
+| `/生活 暂停` | 管理员：不拦截、不主动开口，按正常频率回复 |
+| `/生活 恢复` | 管理员：恢复闸门 |
+| `/生活 重置` | 管理员：重新取种子活动 |
+
+别名：`/life`、`/频率`。
+
+「暂停」写在**状态文件**里而不是配置里，所以重启后依然有效——它是个运行时开关，
+不该和「配置」混在一起。
+
+---
+
+## 经济维度（按月花钱）
+
+原版通过跨插件 RPC 读 budget-pacer；AstrBot 里改成直接查 **AstrBot 自己的
+`provider_stats` 表**（WebUI 仪表盘那个 token 计数器背后的表），按你填的单价折算：
+
+```json
+"economy": {
+  "enabled": true,
+  "monthly_budget": 30,
+  "price_input_per_mtok": 2.0,
+  "price_cached_input_per_mtok": 0.5,
+  "price_output_per_mtok": 8.0
+}
+```
+
+> 默认单价只是占位，**请按你实际用的模型改成真实价格**，否则「这个月花了多少钱」
+> 会算错（但不会影响她的行为——经济不参与倍率）。
+
+- **输入 / 缓存输入 / 输出**三种 token 分别计价（单价都是「元 / 百万 token」）；
+- 按**本地月份**（`simulation.tz_offset_minutes`）聚合，跨月自动重置；
+- 花费比例决定档位：`broke` / `tight` / `roomy`，再由
+  `hint_in_prompt` 决定要不要在提示词里加一句「手头紧」的约束。
+
+**两个必须知道的限制**（都写进了代码注释，以免以后误解）：
+
+1. AstrBot 只在**内部 agent** 跑完一轮时写 `provider_stats`。插件自己发起的
+   `llm_generate`（比如每 10 分钟问一次「你在做什么」）**不在这张表里**，所以
+   月度花费**偏低**。想让她省钱看的是统计表里的那部分，够用就行。
+2. **经济不参与倍率计算**，只影响提示词里的语气与用词。这是原版的立场：因为省
+   钱而少说话是另一种因果，不该混进「她今天心情如何」里。
+
+---
+
+## 主动开口
+
+`proactive.enabled` 默认**关闭**。打开后，她会挑一条还没过期的素材（`events` 里
+攒下的念头），在满足全部硬闸时主动发一条消息：
+
+- 不在睡觉、体力 ≥ `minimum_energy`、不在 `quiet_hours`
+- 距上次主动 ≥ `min_interval_minutes`（私聊里对方一直不回应会按
+  `unanswered_backoff_factor` 指数退避）
+- 今天主动次数 < `daily_max`
+- 距对方上次说话 ≥ `recent_user_silence_minutes`
+
+任何一条不满足都会被记进沉默台账，`/生活 为什么` 能看到分布。
+
+---
+
+## 被 @ 唤醒
+
+她睡着时倍率是 0。但对方已经 `@` 了她，这时候"一条都不回"体验很差，所以：
+
+- `simulation.wake_on_at`（默认 **开**）：睡眠中被 `@` 会开一个
+  `wake_minutes`（默认 10 分钟）的清醒窗口，窗口内倍率按清醒算，这一次真的会回；
+- 关掉它 = 「睡着连 `@` 都不回」（原版的一种可选行为）。
+
+窗口过期后，只要活动仍是 `sleep` 就自动回到静默，不需要额外清理。
+
+---
+
+## 数据与持久化
+
+状态全部存在：
+
+```
+data/plugin_data/astrbot_plugin_lifefrequency/state.json
+```
+
+- 原子写（先写 `state.tmp` 再 `os.replace`），断电不会写出半截 JSON；
+- 每次保存会留一份 `state.json.bak`（**上一次**成功保存的内容）；
+- 主文件损坏时自动隔离成 `state.bad-<时间戳>.json` 并退到备份恢复，日志里会写明；
+- 想从头开始：删掉这个目录，或发 `/生活 重置`。
+
+插件**不会**往自己的安装目录写任何东西，更新插件不会丢状态。
+
+---
+
+## 主要配置项
+
+完整的配置说明在 WebUI 的配置页里（每个字段都有中文描述）。几个最常调的：
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `plugin.enabled` | `true` | 总开关 |
+| `simulation.tick_seconds` | `600` | 生活推进间隔，最小 60 |
+| `simulation.dry_run` | `false` | 只推进生活、不拦截不主动开口（排查用） |
+| `simulation.sleep_window` | `03:00-11:00` | 她倾向的睡眠时段 |
+| `activity.mode` | `llm` | `llm`=让模型决定；`rules`=只用时段表（不花 token） |
+| `gate.enabled` | `true` | 回复闸门开关 |
+| `gate.mode` | `count` | `count` 计数门 / `probability` 概率门 |
+| `gate.base_talk_value` | `1.0` | 计数门的基础频率，越大越爱说话 |
+| `gate.filter_mode` | `all` | `all` / `whitelist` / `blacklist`（配合 `target_chats`） |
+| `prompt.inject_enabled` | `true` | 把生活摘要注入系统提示词 |
+| `prompt.max_chars` | `600` | 注入长度上限 |
+| `proactive.enabled` | `false` | 主动开口 |
+| `economy.enabled` | `true` | 经济维度（单价默认按常见价位预填，请改成你自己的） |
+
+改完配置在 WebUI 里保存即可（会触发插件重载）；`tick_seconds`、
+`sleep_window` 这类结构性参数需要重载才生效。
+
+---
+
+## 与 MaiBot 版的差异
+
+保留：全部生活机制、活动集合、强制层、情绪/体力/睡眠/生病/日期节日、事件素材、
+主动开口的评分与硬闸、沉默台账、全部卡片文案。
+
+替换或删除：
+
+| 原版 | AstrBot 版 |
+| --- | --- |
+| `frequency.set_adjust` 下发倍率 + 回读校验 + 写不进去的退避 | **自建回复闸门**（无宿主可写，因此没有「写失败」这一整类问题） |
+| budget-pacer 跨插件 RPC 读预算 | 查 AstrBot 自己的 `provider_stats` 表按单价折算 |
+| `life_host_model.py`（宿主模型探测） | 删除，AstrBot 有统一的 provider 抽象 |
+| `life_social.py`（better-diary 社交联动） | 删除（依赖另一个插件） |
+| `reply_necessity` / `dynamic` 两档闸门 | 只保留 `count` / `probability` |
+| `/生活 重锚` | 删除（对应宿主的锚点概念） |
+
+---
+
+## 开发与测试
+
+`core/` 里是**纯模拟层**：不碰网络、不碰数据库、不依赖 AstrBot，可以直接测。
+`main.py` 只是把它接到 AstrBot 上的薄适配层。
+
+```bash
+cd astrbot_plugin_lifefrequency
+python -m pytest tests -q
+```
+
+覆盖：活动决策与强制层、作息班表、倍率因子、事件素材、回复闸门、经济折算、
+主动开口、配置接线。测试不需要安装 AstrBot。
+
+---
+
+## 许可
+
+MIT，见 `LICENSE`。原始设计与实现 © orge-8（[life-frequency](https://github.com/orge-8/life-frequency)）。

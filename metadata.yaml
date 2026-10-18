@@ -1,0 +1,8 @@
+name: astrbot_plugin_lifefrequency
+display_name: 生活频率
+desc: 给机器人一份持续的小生活（LLM 决定作息活动、情绪体力、身体、日期节日、按 Token 计价的经济），并按生活状态决定群聊自动回复的频率：睡觉时不回话，感冒时话少，攒了素材会主动开口。移植自 MaiBot 插件 orge-8/life-frequency。
+short_desc: 按她的生活状态自动决定群聊回复频率与主动开口。
+version: 2.0.0
+author: orge-8 (original), AstrBot port
+repo: https://github.com/orge-8/life-frequency
+astrbot_version: ">=4.24"

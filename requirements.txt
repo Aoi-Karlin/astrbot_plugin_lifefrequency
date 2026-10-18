@@ -1,0 +1,2 @@
+# No third-party dependencies: the plugin uses only the Python standard library
+# and APIs provided by AstrBot itself (sqlmodel/sqlalchemy ship with AstrBot).

@@ -1,0 +1,873 @@
+{
+  "plugin": {
+    "description": "基础",
+    "type": "object",
+    "hint": "总开关。关闭后不跑生活循环、不拦截、不主动开口，但 /生活 指令仍可查看最后状态。",
+    "items": {
+      "enabled": {
+        "description": "启用生活频率",
+        "type": "bool",
+        "default": true,
+        "hint": "关掉后她会像普通 AstrBot 一样回复；状态文件保留，重新开启后继续。"
+      }
+    }
+  },
+  "simulation": {
+    "description": "生活模拟",
+    "type": "object",
+    "hint": "她多久醒一次、什么时候睡觉、跨重启怎么补账。",
+    "items": {
+      "tick_seconds": {
+        "description": "生活循环间隔（秒）",
+        "type": "int",
+        "default": 600,
+        "slider": {"min": 60, "max": 3600, "step": 60},
+        "hint": "每隔多久结算一次情绪/体力、判断要不要切换活动。低于 60 秒按 60 秒算。"
+      },
+      "catch_up_max_hours": {
+        "description": "停机补账上限（小时）",
+        "type": "float",
+        "default": 72.0,
+        "slider": {"min": 0.5, "max": 168.0, "step": 0.5},
+        "hint": "插件停了一段时间再启动时，最多按多少小时补算睡眠与体力；超过部分直接跳过。"
+      },
+      "offline_gap_minutes": {
+        "description": "离线判定（分钟）",
+        "type": "int",
+        "default": 30,
+        "slider": {"min": 0, "max": 720, "step": 5},
+        "hint": "两次 tick 间隔超过这个值就当作「插件停过」，按离线补账处理。"
+      },
+      "seed": {
+        "description": "随机种子",
+        "type": "string",
+        "default": "",
+        "hint": "留空即可。填一个固定值可复现事件与活动的随机结果（调试用）。"
+      },
+      "dry_run": {
+        "description": "演算模式",
+        "type": "bool",
+        "default": false,
+        "hint": "只计算倍率与闸门结果，不拦截、不主动开口。用来观察她「本会怎么做」而不影响群聊。"
+      },
+      "tz_offset_minutes": {
+        "description": "时区偏移（分钟）",
+        "type": "int",
+        "default": 480,
+        "slider": {"min": -720, "max": 840, "step": 30},
+        "hint": "本地时间 = UTC + 这个偏移。北京时间为 480。"
+      },
+      "day_boundary_hour": {
+        "description": "生活日切分点（小时）",
+        "type": "int",
+        "default": 12,
+        "slider": {"min": 0, "max": 23, "step": 1},
+        "hint": "过了这个点算新的一天（睡眠/清醒记账、每日上限都按它重置）。12 点切分更贴近熬夜作息。"
+      },
+      "sleep_window": {
+        "description": "睡觉时段",
+        "type": "string",
+        "default": "03:00-11:00",
+        "hint": "格式 HH:MM-HH:MM。她在这个窗口内、体力低于阈值时会去睡。"
+      },
+      "sleep_energy_threshold": {
+        "description": "睡觉体力阈值",
+        "type": "float",
+        "default": 3.0,
+        "slider": {"min": 0.0, "max": 10.0, "step": 0.1},
+        "hint": "体力低于它才会在睡觉时段里睡着；高于它继续熬夜。"
+      },
+      "max_sleep_hours": {
+        "description": "单次睡眠上限（小时）",
+        "type": "float",
+        "default": 12.0,
+        "slider": {"min": 0.5, "max": 24.0, "step": 0.5},
+        "hint": "睡够这么久一定醒，避免连睡一整天。"
+      },
+      "energy_full_wake": {
+        "description": "睡满自然醒",
+        "type": "bool",
+        "default": true,
+        "hint": "体力回满时提前醒来（不必等到睡觉时段结束）。"
+      },
+      "wake_on_at": {
+        "description": "@ 时唤醒",
+        "type": "bool",
+        "default": true,
+        "hint": "她在睡（倍率 0）时被 @，打开一个短暂的清醒窗口，让她能回一句；窗口过后自动回睡。"
+      },
+      "wake_minutes": {
+        "description": "唤醒窗口（分钟）",
+        "type": "int",
+        "default": 10,
+        "slider": {"min": 1, "max": 120, "step": 1},
+        "hint": "被 @ 后保持清醒多久。只影响回复闸门，睡眠记账照常。"
+      }
+    }
+  },
+  "persona": {
+    "description": "人设",
+    "type": "object",
+    "hint": "活动决策与主动开口都用这段人设。留空时读取 AstrBot 的默认人格。",
+    "items": {
+      "text": {
+        "description": "人设文本",
+        "type": "text",
+        "default": "",
+        "hint": "留空 = 使用 AstrBot 人格管理里的默认人格。填写后优先用这里的内容。"
+      },
+      "bot_name": {
+        "description": "她的名字",
+        "type": "string",
+        "default": "",
+        "hint": "提示词里怎么称呼她。留空时用 AstrBot 的机器人昵称。"
+      }
+    }
+  },
+  "activity": {
+    "description": "活动决策",
+    "type": "object",
+    "hint": "她现在在做什么：由模型选，或由内置时段表决定。",
+    "items": {
+      "mode": {
+        "description": "决策方式",
+        "type": "string",
+        "default": "llm",
+        "options": ["llm", "rules"],
+        "labels": ["模型决策", "规则时段表"],
+        "hint": "模型决策更像活着，但每轮要一次模型调用；规则时段表零开销、行为固定。"
+      },
+      "min_dwell_minutes": {
+        "description": "最短停留（分钟）",
+        "type": "int",
+        "default": 60,
+        "slider": {"min": 0, "max": 600, "step": 10},
+        "hint": "一个活动至少持续这么久才允许切换，避免每分钟换一次。"
+      },
+      "min_sleep_minutes": {
+        "description": "最短睡眠（分钟）",
+        "type": "int",
+        "default": 180,
+        "slider": {"min": 0, "max": 720, "step": 10},
+        "hint": "睡着后至少睡这么久才考虑醒。"
+      },
+      "min_awake_hours_per_day": {
+        "description": "每日最少清醒（小时）",
+        "type": "float",
+        "default": 8.0,
+        "slider": {"min": 0.0, "max": 24.0, "step": 0.5},
+        "hint": "清醒时长不够时强制她醒着，避免一天睡过去。"
+      },
+      "reseed_after_hours": {
+        "description": "重新播种间隔（小时）",
+        "type": "float",
+        "default": 8.0,
+        "slider": {"min": 0.5, "max": 48.0, "step": 0.5},
+        "hint": "当前活动持续太久时，允许规则层重新给一个种子活动。"
+      },
+      "activity_factors": {
+        "description": "活动倍率表",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": [
+          "sleep=0.0",
+          "sick_rest=1.0",
+          "before_sleep=1.15",
+          "commute=0.85",
+          "work=0.75",
+          "meeting=0.5",
+          "overtime=0.45",
+          "lunch=1.1",
+          "off_work=1.0",
+          "night_study=0.5",
+          "music=0.9",
+          "game=0.75",
+          "anime=0.75",
+          "daze=0.6",
+          "daily=1.0"
+        ],
+        "hint": "每行 key=值，key 是活动枚举键。sleep=0 意味着睡着时完全静默。"
+      },
+      "factors_mode": {
+        "description": "倍率表合并方式",
+        "type": "string",
+        "default": "merge",
+        "options": ["merge", "replace"],
+        "labels": ["合并（缺失项用默认）", "替换（只用这里写的）"],
+        "hint": "replace 模式下漏写 sleep 会让她睡觉时仍按 1.0 回复。"
+      }
+    }
+  },
+  "activity_llm": {
+    "description": "活动模型",
+    "type": "object",
+    "hint": "模型决策模式下的调用参数；规则模式不使用。",
+    "items": {
+      "provider_id": {
+        "description": "活动决策模型",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "留空时用当前会话的聊天模型。建议选便宜的小模型。"
+      },
+      "temperature": {
+        "description": "温度",
+        "type": "float",
+        "default": 0.8,
+        "slider": {"min": 0.0, "max": 2.0, "step": 0.1}
+      },
+      "max_tokens": {
+        "description": "最大输出 token",
+        "type": "int",
+        "default": 200,
+        "slider": {"min": 50, "max": 2000, "step": 50},
+        "hint": "活动决策只要一小段 JSON，不需要长输出。"
+      },
+      "timeout_ms": {
+        "description": "调用超时（毫秒）",
+        "type": "int",
+        "default": 120000,
+        "slider": {"min": 5000, "max": 300000, "step": 1000}
+      },
+      "min_interval_seconds": {
+        "description": "最短调用间隔（秒）",
+        "type": "int",
+        "default": 600,
+        "slider": {"min": 0, "max": 3600, "step": 30},
+        "hint": "两次活动决策之间至少隔这么久，避免频繁烧钱。"
+      },
+      "fail_streak_limit": {
+        "description": "连续失败上限",
+        "type": "int",
+        "default": 3,
+        "slider": {"min": 1, "max": 20, "step": 1},
+        "hint": "连续失败这么多次后进入冷却，期间改用规则时段表。"
+      },
+      "cooldown_minutes": {
+        "description": "失败冷却（分钟）",
+        "type": "int",
+        "default": 30,
+        "slider": {"min": 0, "max": 720, "step": 5}
+      },
+      "recent_events_in_prompt": {
+        "description": "提示词里带几条近期活动",
+        "type": "int",
+        "default": 8,
+        "slider": {"min": 0, "max": 50, "step": 1}
+      },
+      "recent_near_hours": {
+        "description": "「近期」范围（小时）",
+        "type": "float",
+        "default": 12.0,
+        "slider": {"min": 1.0, "max": 72.0, "step": 1.0}
+      },
+      "recent_mid_hours": {
+        "description": "「中期」范围（小时）",
+        "type": "float",
+        "default": 72.0,
+        "slider": {"min": 6.0, "max": 336.0, "step": 6.0}
+      },
+      "recent_far_days": {
+        "description": "「远期」范围（天）",
+        "type": "float",
+        "default": 14.0,
+        "slider": {"min": 1.0, "max": 90.0, "step": 1.0}
+      },
+      "recent_pick_mode": {
+        "description": "近期活动挑选方式",
+        "type": "string",
+        "default": "smart",
+        "options": ["smart", "recent"],
+        "labels": ["按标签去重", "按时间取最近"],
+        "hint": "smart 会尽量每条标签只留一条，避免提示词被同一类活动刷屏。"
+      },
+      "recent_max_per_label": {
+        "description": "每条标签最多几条",
+        "type": "int",
+        "default": 1,
+        "slider": {"min": 1, "max": 10, "step": 1}
+      },
+      "recent_events_keep": {
+        "description": "活动历史保留条数",
+        "type": "int",
+        "default": 300,
+        "slider": {"min": 0, "max": 2000, "step": 10},
+        "hint": "状态文件里最多保留多少条活动记录。"
+      },
+      "persona_max_chars": {
+        "description": "人设截断字数",
+        "type": "int",
+        "default": 600,
+        "slider": {"min": 0, "max": 4000, "step": 100},
+        "hint": "拼进活动提示词的人设最多多长；0 = 完全不带人设。"
+      },
+      "skip_when_forced": {
+        "description": "强制活动时跳过模型",
+        "type": "bool",
+        "default": true,
+        "hint": "健康/班表已经强制了活动时不再调用模型，省一次开销。"
+      }
+    }
+  },
+  "schedule": {
+    "description": "作息班表",
+    "type": "object",
+    "hint": "让「上班」成为真实约束：在岗时段不许睡、不许打游戏看番。默认关闭。",
+    "items": {
+      "enabled": {
+        "description": "启用班表",
+        "type": "bool",
+        "default": false
+      },
+      "workdays": {
+        "description": "工作日",
+        "type": "string",
+        "default": "1-5",
+        "hint": "支持 1-5、1,3,5、六日、周三、周日、一二三四五 等写法。1=周一。"
+      },
+      "work_window": {
+        "description": "在岗时段",
+        "type": "string",
+        "default": "09:30-18:30",
+        "hint": "格式 HH:MM-HH:MM。"
+      },
+      "commute_minutes": {
+        "description": "通勤时长（分钟）",
+        "type": "int",
+        "default": 45,
+        "slider": {"min": 0, "max": 240, "step": 5},
+        "hint": "在岗时段前后各留这么久作为通勤。"
+      },
+      "lunch_window": {
+        "description": "午休时段",
+        "type": "string",
+        "default": "12:00-13:00",
+        "hint": "格式 HH:MM-HH:MM。午休时可以看番、打游戏。"
+      },
+      "duty": {
+        "description": "岗位职责",
+        "type": "text",
+        "default": "",
+        "hint": "写进活动提示词，例如「FMInfinity 共鸣电台无线电技术员」。"
+      },
+      "work_scene": {
+        "description": "在岗场景文字",
+        "type": "text",
+        "default": "",
+        "hint": "在岗时卡片上显示的场景，例如「在电台值守」。留空用内置文案。"
+      }
+    }
+  },
+  "emotion_energy": {
+    "description": "情绪与体力",
+    "type": "object",
+    "hint": "两个 0~10 的标量，共同决定倍率。",
+    "items": {
+      "inertia_minutes": {
+        "description": "情绪惯性（分钟）",
+        "type": "int",
+        "default": 40,
+        "slider": {"min": 0, "max": 240, "step": 5},
+        "hint": "情绪变化后的余温时长：不会立刻回落。"
+      },
+      "recover_per_tick": {
+        "description": "每轮体力恢复",
+        "type": "float",
+        "default": 0.2,
+        "slider": {"min": 0.0, "max": 2.0, "step": 0.05}
+      },
+      "sleep_recover_multiplier": {
+        "description": "睡眠恢复倍率",
+        "type": "float",
+        "default": 2.0,
+        "slider": {"min": 0.0, "max": 10.0, "step": 0.5}
+      },
+      "afterglow_span_hours": {
+        "description": "余韵持续（小时）",
+        "type": "float",
+        "default": 24.0,
+        "slider": {"min": 0.0, "max": 168.0, "step": 1.0},
+        "hint": "生日/节日带来的情绪加成慢慢消退的时长。"
+      },
+      "afterglow_cap": {
+        "description": "余韵上限",
+        "type": "float",
+        "default": 0.6,
+        "slider": {"min": 0.0, "max": 5.0, "step": 0.1}
+      },
+      "emotion_curve": {
+        "description": "情绪 → 倍率曲线",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": ["0=0.55", "5=0.95", "10=1.35"],
+        "hint": "每行 情绪值=倍率，至少两点，线性插值。"
+      },
+      "energy_curve": {
+        "description": "体力 → 倍率曲线",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": ["0=0.50", "5=0.85", "10=1.25"],
+        "hint": "每行 体力值=倍率，至少两点，线性插值。"
+      }
+    }
+  },
+  "frequency": {
+    "description": "倍率",
+    "type": "object",
+    "hint": "活动 × 情绪 × 体力 × 健康 × 日期，最后夹在上下限之间。倍率只喂给本插件的回复闸门。",
+    "items": {
+      "min_adjust": {
+        "description": "倍率下限",
+        "type": "float",
+        "default": 0.0,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.05}
+      },
+      "max_adjust": {
+        "description": "倍率上限",
+        "type": "float",
+        "default": 2.0,
+        "slider": {"min": 0.1, "max": 5.0, "step": 0.1}
+      },
+      "silence_floor": {
+        "description": "静默下限",
+        "type": "float",
+        "default": 0.0,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.01},
+        "hint": "大于 0 时，硬闸（睡觉/安静时段）不会让她完全静默，而是保留这个倍率。"
+      },
+      "quiet_hours": {
+        "description": "安静时段",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": ["23:30-08:00"],
+        "hint": "格式 HH:MM-HH:MM，一行一个。安静时段内倍率归零（静默下限除外）。"
+      },
+      "paused": {
+        "description": "启动时暂停",
+        "type": "bool",
+        "default": false,
+        "hint": "暂停 = 不拦截、不主动开口，她按正常频率回复。运行时可用 /生活 暂停 切换。"
+      },
+      "material_bonus": {
+        "description": "素材加成",
+        "type": "float",
+        "default": 0.15,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.05},
+        "hint": "有新鲜素材（想说的话）时给倍率加一点。"
+      },
+      "material_bonus_cap": {
+        "description": "素材加成上限",
+        "type": "float",
+        "default": 0.45,
+        "slider": {"min": 0.0, "max": 2.0, "step": 0.05}
+      }
+    }
+  },
+  "gate": {
+    "description": "回复闸门",
+    "type": "object",
+    "hint": "AstrBot 没有频率旋钮，所以本插件自己做群聊纯闲聊的回复闸门。@、唤醒前缀与私聊始终照常。",
+    "items": {
+      "enabled": {
+        "description": "启用闸门",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后群聊纯闲聊完全不主动开口；其它插件的命令不受影响。"
+      },
+      "mode": {
+        "description": "闸门模式",
+        "type": "string",
+        "default": "count",
+        "options": ["count", "probability"],
+        "labels": ["计数门", "概率门"],
+        "hint": "计数门：攒够 N 条纯闲聊才回一次；概率门：每条按概率掷骰。"
+      },
+      "base_talk_value": {
+        "description": "基础频率（计数门）",
+        "type": "float",
+        "default": 1.0,
+        "slider": {"min": 0.01, "max": 10.0, "step": 0.01},
+        "hint": "生效频率 = 基础频率 × 倍率；阈值 = ceil(1 / 生效频率)。"
+      },
+      "base_probability": {
+        "description": "基础概率（概率门）",
+        "type": "float",
+        "default": 0.2,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.01},
+        "hint": "每条纯闲聊的实际概率 = 基础概率 × 倍率（夹到 0~1）。"
+      },
+      "min_reply_interval_seconds": {
+        "description": "最短回复间隔（秒）",
+        "type": "int",
+        "default": 0,
+        "slider": {"min": 0, "max": 3600, "step": 10},
+        "hint": "刚回过后这段时间内不再自动开口。"
+      },
+      "filter_mode": {
+        "description": "生效范围",
+        "type": "string",
+        "default": "all",
+        "options": ["all", "whitelist", "blacklist"],
+        "labels": ["全部会话", "仅白名单", "排除黑名单"],
+        "hint": "白名单 = 只有名单里的群受她作息影响（其它群正常回复）；黑名单 = 名单里的群不受影响。注意：白名单为空时等于谁都不生效。"
+      },
+      "target_chats": {
+        "description": "范围名单（群）",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": [],
+        "hint": "一行一个，直接填群号即可，例如 123456789。也支持 group:123456 与完整 umo。私聊不受此名单影响，永远会回复。"
+      }
+    }
+  },
+  "health": {
+    "description": "健康",
+    "type": "object",
+    "hint": "睡眠债与感冒：熬夜多了会更容易生病，生病时倍率大幅降低。",
+    "items": {
+      "sleep_debt_threshold_minutes": {
+        "description": "睡眠债阈值（分钟）",
+        "type": "int",
+        "default": 300,
+        "slider": {"min": 0, "max": 1440, "step": 30},
+        "hint": "一晚比应睡时长少这么多就算欠债。"
+      },
+      "sleep_debt_cap_nights": {
+        "description": "睡眠债上限（晚）",
+        "type": "int",
+        "default": 3,
+        "slider": {"min": 1, "max": 14, "step": 1}
+      },
+      "sleep_deprived_energy_cap": {
+        "description": "缺觉时体力上限",
+        "type": "float",
+        "default": 8.5,
+        "slider": {"min": 1.0, "max": 10.0, "step": 0.5}
+      },
+      "health_factors": {
+        "description": "健康倍率表",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": ["healthy=1.0", "cold=0.3", "sleep_deprived=0.9"]
+      },
+      "cold_check_hour": {
+        "description": "感冒判定时刻（小时）",
+        "type": "int",
+        "default": 2,
+        "slider": {"min": 0, "max": 23, "step": 1}
+      },
+      "cold_min_days": {
+        "description": "感冒最短（天）",
+        "type": "int",
+        "default": 1,
+        "slider": {"min": 1, "max": 14, "step": 1}
+      },
+      "cold_max_days": {
+        "description": "感冒最长（天）",
+        "type": "int",
+        "default": 3,
+        "slider": {"min": 1, "max": 30, "step": 1}
+      },
+      "cold_base_risk": {
+        "description": "基础感冒概率",
+        "type": "float",
+        "default": 0.05,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.01}
+      },
+      "cold_sleep_debt_risk": {
+        "description": "每晚睡眠债增加的概率",
+        "type": "float",
+        "default": 0.08,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.01}
+      }
+    }
+  },
+  "date": {
+    "description": "日期与节日",
+    "type": "object",
+    "hint": "生日与节日会抬高倍率、带来素材。",
+    "items": {
+      "birthday": {
+        "description": "生日",
+        "type": "string",
+        "default": "",
+        "hint": "格式 MM-DD，例如 02-07。留空 = 不过生日。"
+      },
+      "birthday_factor": {
+        "description": "生日倍率",
+        "type": "float",
+        "default": 1.3,
+        "slider": {"min": 0.2, "max": 5.0, "step": 0.1}
+      },
+      "birthday_emotion": {
+        "description": "生日情绪加成",
+        "type": "float",
+        "default": 1.5,
+        "slider": {"min": -5.0, "max": 5.0, "step": 0.5}
+      },
+      "birthday_material": {
+        "description": "生日素材",
+        "type": "text",
+        "default": "今天是我生日",
+        "hint": "生日当天她会「想说」的这句话。"
+      },
+      "festivals": {
+        "description": "节日表",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": [],
+        "hint": "格式 MM-DD|名称|factor=..|emotion=..|energy=..|weight=..|material=..，例如 06-01|儿童节|factor=1.1|material=今天路上好多小孩"
+      },
+      "date_factors": {
+        "description": "日期因子覆盖",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": [],
+        "hint": "按节日名称覆盖倍率，一行一个，例如 生日=1.4"
+      }
+    }
+  },
+  "events": {
+    "description": "随机事件与素材",
+    "type": "object",
+    "hint": "生活中偶尔发生的小事，会成为她想说的话题。",
+    "items": {
+      "extra": {
+        "description": "自定义事件",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": [],
+        "hint": "一行一个，例如 期中考试|activities=sleep|emotion=-1|energy=-1"
+      },
+      "disabled": {
+        "description": "禁用的事件",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": [],
+        "hint": "写事件名，一行一个。"
+      },
+      "fire_probability": {
+        "description": "事件触发概率",
+        "type": "float",
+        "default": 0.4,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.05}
+      },
+      "material_ttl_hours": {
+        "description": "素材有效期（小时）",
+        "type": "float",
+        "default": 6.0,
+        "slider": {"min": 0.5, "max": 72.0, "step": 0.5},
+        "hint": "事件素材过了这么久就不再算「新鲜」。"
+      },
+      "material_best_ratio": {
+        "description": "最佳素材比例",
+        "type": "float",
+        "default": 0.5,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.1},
+        "hint": "素材在有效期内用到这个比例之前算最佳，之后开始保鲜衰减。"
+      },
+      "material_decay_floor": {
+        "description": "保鲜衰减下限",
+        "type": "float",
+        "default": 0.25,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.05}
+      }
+    }
+  },
+  "proactive": {
+    "description": "主动开口",
+    "type": "object",
+    "hint": "她按自己的意愿在群里先说话，而不是等别人 @。默认关闭。",
+    "items": {
+      "enabled": {
+        "description": "启用主动开口",
+        "type": "bool",
+        "default": false
+      },
+      "score_threshold": {
+        "description": "开口分数阈值",
+        "type": "float",
+        "default": 0.45,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.05},
+        "hint": "意愿分低于它就不开口。"
+      },
+      "min_interval_minutes": {
+        "description": "最短间隔（分钟）",
+        "type": "int",
+        "default": 180,
+        "slider": {"min": 0, "max": 1440, "step": 30}
+      },
+      "recent_user_silence_minutes": {
+        "description": "用户沉默多久后才考虑",
+        "type": "int",
+        "default": 30,
+        "slider": {"min": 0, "max": 720, "step": 5}
+      },
+      "daily_max": {
+        "description": "每日上限",
+        "type": "int",
+        "default": 1,
+        "slider": {"min": 0, "max": 20, "step": 1}
+      },
+      "minimum_energy": {
+        "description": "最低体力",
+        "type": "float",
+        "default": 2.5,
+        "slider": {"min": 0.0, "max": 10.0, "step": 0.5}
+      },
+      "quiet_hours": {
+        "description": "安静时段",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": ["00:00-08:00"],
+        "hint": "格式 HH:MM-HH:MM。这些时段绝不主动开口。"
+      },
+      "unanswered_backoff_factor": {
+        "description": "没人理时的退避倍数",
+        "type": "float",
+        "default": 2.0,
+        "slider": {"min": 1.0, "max": 10.0, "step": 0.5},
+        "hint": "上次主动开口没人接话，下次间隔乘这个倍数。"
+      },
+      "unanswered_backoff_max_streak": {
+        "description": "退避最大连击",
+        "type": "int",
+        "default": 4,
+        "slider": {"min": 0, "max": 20, "step": 1}
+      },
+      "filter_mode": {
+        "description": "生效范围",
+        "type": "string",
+        "default": "all",
+        "options": ["all", "whitelist", "blacklist"],
+        "labels": ["全部会话", "仅白名单", "排除黑名单"]
+      },
+      "target_chats": {
+        "description": "范围名单",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": [],
+        "hint": "一行一个。支持完整 umo、group:123456、private:123456 或裸 ID。"
+      }
+    }
+  },
+  "economy": {
+    "description": "经济",
+    "type": "object",
+    "hint": "用 AstrBot 记录的 token 用量 × 单价，估算本月花费，当作她的生活费。经济只影响行为，不影响倍率。",
+    "items": {
+      "enabled": {
+        "description": "启用经济",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后卡片显示「未接入」，她也不会因为手头紧改变活动。"
+      },
+      "monthly_budget": {
+        "description": "月度生活费（元）",
+        "type": "float",
+        "default": 30.0,
+        "slider": {"min": 0.0, "max": 10000.0, "step": 1.0},
+        "hint": "0 = 没设置生活费，分档为「未知」，不会触发省钱行为。"
+      },
+      "currency": {
+        "description": "货币符号",
+        "type": "string",
+        "default": "¥"
+      },
+      "price_input_per_mtok": {
+        "description": "输入 token 单价（元 / 百万）",
+        "type": "float",
+        "default": 2.0,
+        "slider": {"min": 0.0, "max": 1000.0, "step": 0.1}
+      },
+      "price_cached_input_per_mtok": {
+        "description": "缓存输入 token 单价（元 / 百万）",
+        "type": "float",
+        "default": 0.2,
+        "slider": {"min": 0.0, "max": 1000.0, "step": 0.1}
+      },
+      "price_output_per_mtok": {
+        "description": "输出 token 单价（元 / 百万）",
+        "type": "float",
+        "default": 8.0,
+        "slider": {"min": 0.0, "max": 1000.0, "step": 0.1}
+      },
+      "include_plugin_calls": {
+        "description": "计入插件自身的模型调用",
+        "type": "bool",
+        "default": true,
+        "hint": "AstrBot 的 token 统计只记录主对话；打开后本插件的活动决策/主动开口用量也计入。"
+      },
+      "refresh_interval_minutes": {
+        "description": "取数间隔（分钟）",
+        "type": "int",
+        "default": 30,
+        "slider": {"min": 1, "max": 1440, "step": 5}
+      },
+      "stale_after_minutes": {
+        "description": "数据过期（分钟）",
+        "type": "int",
+        "default": 180,
+        "slider": {"min": 0, "max": 1440, "step": 30},
+        "hint": "超过这么久没成功取数，档位显示「未知」并标 ⚠；0 = 关闭过期检查。"
+      },
+      "broke_ratio": {
+        "description": "「见底」余额比例",
+        "type": "float",
+        "default": 0.10,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.01}
+      },
+      "tight_ratio": {
+        "description": "「紧张」余额比例",
+        "type": "float",
+        "default": 0.30,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.01}
+      },
+      "roomy_ratio": {
+        "description": "「宽裕」余额比例",
+        "type": "float",
+        "default": 0.60,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.01}
+      },
+      "tight_pacing": {
+        "description": "「紧张」节奏比",
+        "type": "float",
+        "default": 1.20,
+        "slider": {"min": 1.0, "max": 5.0, "step": 0.1},
+        "hint": "花费进度 / 时间进度 超过它也算手头紧。"
+      },
+      "pacing_from_spend_ratio": {
+        "description": "节奏比生效的最低花费进度",
+        "type": "float",
+        "default": 0.50,
+        "slider": {"min": 0.0, "max": 1.0, "step": 0.05},
+        "hint": "月初时间进度很小，节奏比容易误报；花掉一半以上才用它升级档位。"
+      },
+      "hint_in_prompt": {
+        "description": "把经济约束写进提示词",
+        "type": "bool",
+        "default": true,
+        "hint": "手头紧时提醒她少安排花钱的活动，但不会跟人哭穷。"
+      }
+    }
+  },
+  "prompt": {
+    "description": "提示词注入",
+    "type": "object",
+    "hint": "把她的当前生活状态作为背景注入回复请求，让语气与状态一致。",
+    "items": {
+      "inject_enabled": {
+        "description": "注入生活摘要",
+        "type": "bool",
+        "default": true
+      },
+      "max_chars": {
+        "description": "摘要最大字数",
+        "type": "int",
+        "default": 600,
+        "slider": {"min": 0, "max": 4000, "step": 50},
+        "hint": "0 = 不注入。"
+      }
+    }
+  }
+}
