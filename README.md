@@ -288,4 +288,4 @@ python -m pytest tests -q
 
 ## 许可
 
-MIT，见 `LICENSE`。原始设计与实现 © orge-8（[life-frequency](https://github.com/orge-8/life-frequency)）。
+AGPL v3，见 `LICENSE`。原始设计与实现 © orge-8（[life-frequency](https://github.com/orge-8/life-frequency)）（MIT）。
