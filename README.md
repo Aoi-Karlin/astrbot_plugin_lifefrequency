@@ -331,6 +331,8 @@ data/plugin_data/astrbot_plugin_lifefrequency/state.json
 | `prompt.max_chars` | `600` | 注入长度上限 |
 | `proactive.enabled` | `false` | 主动开口 |
 | `economy.enabled` | `true` | 经济维度（单价默认按常见价位预填，请改成你自己的） |
+| `activity_llm.provider_id` | 空 | 活动决策用哪个模型（下拉选，留空=跟随当前会话） |
+| `proactive.provider_id` | 空 | 主动开口用哪个模型（下拉选，留空=跟随当前会话） |
 | `memory.enabled` | `false` | 与 LivingMemory 长期记忆联动 |
 | `memory.record_activity` | `true` | 记录她换活动（写全局 `livingmemory:life`） |
 | `memory.record_group_events` | `false` | 记录群内对话（写进该群自己的记忆） |

@@ -574,8 +574,36 @@ class LifeFrequencyPlugin(Star):
         )
         return str(getattr(response, "completion_text", "") or "")
 
-    def _default_provider_id(self) -> str:
-        """默认对话模型：先看全局 ``provider_settings.default_provider_id``。"""
+    def _default_provider_id(self, section: str = "activity_llm", umo: str = "") -> str:
+        """插件自己发起模型调用时用哪个模型。
+
+        顺序：
+
+        1. 该分组的 ``provider_id``（WebUI 下拉里选的模型名）；
+        2. AstrBot 当前会话在用的模型（``get_using_provider``）——就是正常回复
+           会用的那个，所以只要机器人能正常回话，这里就一定拿得到；
+        3. 全局 ``provider_settings.default_provider_id``（老版本兼容）。
+
+        第 2 步是关键：``provider_settings.default_provider_id`` 在新版 AstrBot 里
+        已经不存在，只靠它会永远拿到空串，主动开口也就永远发不出去。
+
+        Args:
+            section: 先查哪个配置分组的 ``provider_id``。
+            umo: 会话标识；给出时优先按该会话解析模型（会话可能单独绑定了模型）。
+        """
+        configured = CA.text(CA.section(self.conf, section), "provider_id")
+        if configured:
+            return configured
+        try:
+            getter = getattr(self.context, "get_using_provider", None)
+            if callable(getter):
+                provider = getter(umo or None)
+                meta = getattr(provider, "meta", None)
+                provider_id = str(getattr(meta, "id", "") or "").strip()
+                if provider_id:
+                    return provider_id
+        except Exception:  # noqa: BLE001
+            logger.debug(f"[{PLUGIN_NAME}] 读取当前会话模型失败", exc_info=True)
         try:
             cfg = self.context.get_config()
             settings = cfg.get("provider_settings", {}) if cfg else {}
@@ -914,10 +942,23 @@ class LifeFrequencyPlugin(Star):
         self, umo: str, decision: P.ProactiveDecision, now: float
     ) -> bool:
         """把「想说的话」交给模型润色后主动发出去；失败只记日志。"""
+        ok, reason = await self._send_proactive_detailed(umo, decision, now)
+        if not ok:
+            logger.warning(f"[{PLUGIN_NAME}] 主动开口未发出（{umo}）：{reason}")
+        return ok
+
+    async def _send_proactive_detailed(
+        self, umo: str, decision: P.ProactiveDecision, now: float
+    ) -> tuple[bool, str]:
+        """同 ``_send_proactive``，但把「为什么没发出去」也返回。
+
+        自动触发路径只关心成败，手动测试需要知道原因——否则用户只能看到一句
+        「发送失败」，然后无从下手。返回的第二个值是一条给用户看的中文说明。
+        """
         material = decision.material or {}
         text = str(material.get("text", "") or "").strip()
         if not text:
-            return False
+            return False, "这条素材没有正文"
         prompt = (
             f"【想跟对方说的话】{text}\n"
             f"【开口的理由】{decision.intent or '主动关心一下'}\n"
@@ -925,9 +966,12 @@ class LifeFrequencyPlugin(Star):
             "不要解释这是谁安排的，不要用列表，不要提到「素材」「任务」这类词。"
         )
         try:
-            provider_id = self._default_provider_id()
+            provider_id = self._default_provider_id("proactive", umo)
             if not provider_id:
-                return False
+                return False, (
+                    "没有可用的模型：请在「主动开口 → 主动开口模型」里选一个，"
+                    "或确认 AstrBot 里有已启用的模型"
+                )
             response = await self.context.llm_generate(
                 chat_provider_id=provider_id,
                 prompt=prompt,
@@ -937,15 +981,15 @@ class LifeFrequencyPlugin(Star):
             )
             content = str(getattr(response, "completion_text", "") or "").strip()
             if not content:
-                return False
+                return False, "模型返回了空内容（可以看看是不是被内容审核拦了）"
             await self.context.send_message(
                 umo, MessageChain(chain=[Comp.Plain(content)])
             )
             logger.info(f"[{PLUGIN_NAME}] 主动开口 → {umo}")
-            return True
-        except Exception:  # noqa: BLE001
+            return True, ""
+        except Exception as exc:  # noqa: BLE001
             logger.exception(f"[{PLUGIN_NAME}] 主动开口失败（{umo}）")
-            return False
+            return False, f"{type(exc).__name__}: {exc}"
 
     # ------------------------------------------------------------ 闸门
 
@@ -1280,14 +1324,13 @@ class LifeFrequencyPlugin(Star):
             )
             return
 
-        ok = await self._send_proactive(umo, forced, now)
+        ok, fail_reason = await self._send_proactive_detailed(umo, forced, now)
         if ok:
             logger.info(f"[{PLUGIN_NAME}] 手动触发主动开口成功（{umo}）")
             yield event.plain_result(header + "\n\n✅ 已按自动触发的方式发出，请查看上面的消息。")
         else:
             yield event.plain_result(
-                header
-                + "\n\n❌ 发送失败：多半是没有可用的对话模型（检查是否配置了默认模型）。详情见日志。"
+                header + f"\n\n❌ 发送失败：{fail_reason}\n（详情见日志）"
             )
 
     def _test_decision_header(
