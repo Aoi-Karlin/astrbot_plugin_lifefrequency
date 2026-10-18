@@ -49,6 +49,7 @@ from .core import life_economy as E
 from .core import life_events as EV
 from .core import life_factors as F
 from .core import life_gate as G
+from .core import life_memory as M
 from .core import life_proactive as P
 from .core import life_sim as S
 from .core import render as R
@@ -385,10 +386,12 @@ class LifeFrequencyPlugin(Star):
                 on_offline_gap=self._on_offline_gap,
             )
             decision = await self._ask_activity(now)
+            previous_activity = self.state.activity
             self.state = S.enforce_and_apply(
                 self.state, now=now, config=self.sim_config, decision=decision
             )
             self._maybe_reseed(now)
+            await self._note_activity_memory(now, previous_activity)
             await self._refresh_economy(now)
             await self._maybe_proactive(now)
             self._save_state()
@@ -751,6 +754,101 @@ class LifeFrequencyPlugin(Star):
             stale_after_seconds=CA.num(sec, "stale_after_minutes", 60) * 60,
         )
         return E.frugal_hint(snapshot, tier)
+
+    # ------------------------------------------------------------ 长期记忆联动
+
+    def _memory_config(self) -> tuple[bool, bool]:
+        """读记忆联动的两个开关：``(记录活动, 记录群内事件)``。"""
+        sec = CA.section(self.conf, "memory")
+        if not CA.flag(sec, "enabled", False):
+            return False, False
+        return (
+            CA.flag(sec, "record_activity", True),
+            CA.flag(sec, "record_group_events", False),
+        )
+
+    def _memory_engine(self):
+        """拿 LivingMemory 的引擎；没装/没就绪就返回 ``None``。
+
+        每次现查而不是缓存：用户可能中途装卸插件、或者对方重载后换了实例，
+        缓存会拿到已经 close 的引擎。
+        """
+        try:
+            return M.find_livingmemory_engine(self.context)
+        except Exception:  # noqa: BLE001 —— 联动失败绝不影响主流程
+            # 用 warning 而不是 debug：这里出异常说明**接线错了**（比如宿主改了这个
+            # 属性名），静默降级会让人以为「联动开了但没效果」却查不到原因。
+            logger.warning(
+                f"[{PLUGIN_NAME}] 查找长期记忆插件失败，本次跳过记忆写入", exc_info=True
+            )
+            return None
+
+    async def _note_activity_memory(self, now: float, previous_activity: str) -> None:
+        """活动变了就写一条记忆（活动是全局的，归属 ``LIFE_SCOPE``）。
+
+        Args:
+            now: 当前时间戳。
+            previous_activity: 本轮结算前的活动 id，用来判断是否真的换了。
+        """
+        record_activity, _ = self._memory_config()
+        if not record_activity:
+            return
+        if previous_activity == self.state.activity:
+            return
+        engine = self._memory_engine()
+        if engine is None:
+            return
+
+        sim = self.sim_config
+        entry = M.activity_memory(
+            bot_name=self._bot_name(),
+            activity_label=R.activity_label(self.state.activity),
+            previous_label=R.activity_label(previous_activity),
+            mood_word=M.mood_word(float(self.state.emotion)),
+            energy_word=M.energy_word(float(self.state.energy)),
+            health_word=S.health_label(self.state, now, sim),
+            scene_text=str(getattr(self.state, "scene", "") or ""),
+            now=now,
+            tz_offset_minutes=sim.tz_offset_minutes,
+        )
+        if await M.write_entry(engine, entry):
+            logger.debug(f"[{PLUGIN_NAME}] 已写入活动记忆：{entry.content.splitlines()[0]}")
+        else:
+            logger.debug(f"[{PLUGIN_NAME}] 写入活动记忆失败（LivingMemory 可能正忙）")
+
+    async def _note_group_memory(
+        self, event: AstrMessageEvent, now: float, reply_text: str = ""
+    ) -> None:
+        """群里发生的事写进**该群自己的**记忆（与对话记忆同一条召回路径）。
+
+        Args:
+            event: 消息事件。
+            now: 当前时间戳。
+            reply_text: 她的回复（可为空）。
+        """
+        _, record_events = self._memory_config()
+        if not record_events:
+            return
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        # 只记群聊：私聊的记忆交给 LivingMemory 自己的对话总结更合适
+        if not umo or not self._umo_is_group(umo):
+            return
+        engine = self._memory_engine()
+        if engine is None:
+            return
+
+        entry = M.group_event_memory(
+            bot_name=self._bot_name(),
+            umo=umo,
+            sender_name=str(getattr(event, "sender_name", "") or ""),
+            user_text=str(getattr(event, "message_str", "") or ""),
+            reply_text=reply_text,
+            activity_label=R.activity_label(self.state.activity),
+            now=now,
+            tz_offset_minutes=self.sim_config.tz_offset_minutes,
+        )
+        if not await M.write_entry(engine, entry):
+            logger.debug(f"[{PLUGIN_NAME}] 写入群内记忆失败")
 
     # ------------------------------------------------------------ 主动开口
 
@@ -1177,7 +1275,22 @@ class LifeFrequencyPlugin(Star):
             persona_preview=self._persona_text(),
             persona_limit=CA.integer(llm_sec, "persona_max_chars", 600),
             wake_note=self._wake_note(now),
+            memory_status=self._memory_status(),
         )
+
+    def _memory_status(self) -> str:
+        """一行长期记忆联动状态；未启用时返回空串（卡片不显示）。"""
+        record_activity, record_events = self._memory_config()
+        if not record_activity and not record_events:
+            return ""
+        if self._memory_engine() is None:
+            return "已开启，但没找到 LivingMemory（未安装、未启用或还没初始化完）"
+        parts = []
+        if record_activity:
+            parts.append("活动")
+        if record_events:
+            parts.append("群内对话")
+        return f"已连接 LivingMemory（记录：{'、'.join(parts)}）"
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         """是否管理员：``event.is_admin()`` 为真，或发送者在 ``admins_id`` 里。"""
@@ -1234,6 +1347,27 @@ class LifeFrequencyPlugin(Star):
         if persona:
             parts.append(f"【人设】{persona[:600]}")
         return "\n".join(parts)
+
+    @filter.on_llm_response()
+    async def note_life_memory_on_reply(self, event: AstrMessageEvent, resp: Any):
+        """她回完话，把这次群里的互动写进该群自己的长期记忆（默认关）。
+
+        ⚠ 这里只读取回复文本、不修改 ``resp``：改它会影响实际发出的内容。
+
+        Args:
+            event: 消息事件。
+            resp: AstrBot 的 ``LLMResponse``。
+        """
+        _, record_events = self._memory_config()
+        if not record_events or self.dry_run:
+            return
+        try:
+            reply = str(getattr(resp, "completion_text", "") or "").strip()
+            if not reply:
+                return
+            await self._note_group_memory(event, _now(), reply_text=reply)
+        except Exception:  # noqa: BLE001 —— 联动失败不许影响回复
+            logger.debug(f"[{PLUGIN_NAME}] 写入群内记忆失败", exc_info=True)
 
     @filter.llm_tool(name="get_life_state")
     async def get_life_state(self, event: AstrMessageEvent, detail: str = "") -> str:

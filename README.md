@@ -211,6 +211,49 @@ P = base_probability × (基础频率 × 倍率)
 
 ---
 
+## 与长期记忆插件联动（LivingMemory）
+
+装了 [astrbot_plugin_livingmemory](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory)
+的话，可以把她**经历的事**写进长期记忆，让她"真的活过"而不只是"此刻在演"。
+
+**默认关闭**，在配置里打开「长期记忆联动 → 启用联动」即可。没装那个插件也不会报错，
+只是每次静默跳过。
+
+### 存到哪里：活动和对话分开算
+
+| 内容 | 写入范围 | 说明 |
+| --- | --- | --- |
+| 她换了活动 | `livingmemory:life`（全局） | 她自己的生活，不属于任何一次对话 |
+| 群里的对话 | **该群自己的 umo** | 与对话记忆走同一条召回路径，天然按群隔离 |
+
+这个划分对应你原来的「对话隔离」：**活动全局共享，群内事件分群**。
+
+⚠️ 有一点需要知道：`livingmemory:life` 里的活动记忆**不会被 LivingMemory 自动召回**
+（它的检索按 session 精确过滤，群里查不到）。它的作用有两个——留存回顾，
+以及让 `/生活 状态` 有据可查。**"她此刻在做什么"是靠本插件自己的提示词注入
+共享给所有群的**，那部分本来就是全局的，不依赖记忆检索。
+
+群内对话默认**不记录**：LivingMemory 自己会总结对话，再记一遍容易让记忆变啰嗦。
+想要可以用 `memory.record_group_events` 打开。
+
+### 写进去长什么样
+
+两种检索都照顾到——先一句自然叙述（供向量/BM25 命中），再跟结构化字段（供人回顾）：
+
+```
+10-18 15:20，她在阳台看雨，心情平静，体力有点累（原本在发呆）。 雨点敲着栏杆
+时间=10-18 15:20 活动=阳台看雨 上一项=发呆 心情=平静 体力=有点累 身体=身体健康 场景=雨点敲着栏杆
+```
+
+在 LivingMemory 的 WebUI 里可以用 `memory_type = LIFE` 把它们筛出来。
+
+### 排查
+
+发 `/生活 状态`，会多一行「长期记忆：」——显示 `已连接 LivingMemory（记录：活动）`
+或是 `已开启，但没找到 LivingMemory（未安装、未启用或还没初始化完）`。
+
+---
+
 ## 数据与持久化
 
 状态全部存在：
@@ -247,6 +290,9 @@ data/plugin_data/astrbot_plugin_lifefrequency/state.json
 | `prompt.max_chars` | `600` | 注入长度上限 |
 | `proactive.enabled` | `false` | 主动开口 |
 | `economy.enabled` | `true` | 经济维度（单价默认按常见价位预填，请改成你自己的） |
+| `memory.enabled` | `false` | 与 LivingMemory 长期记忆联动 |
+| `memory.record_activity` | `true` | 记录她换活动（写全局 `livingmemory:life`） |
+| `memory.record_group_events` | `false` | 记录群内对话（写进该群自己的记忆） |
 
 改完配置在 WebUI 里保存即可（会触发插件重载）；`tick_seconds`、
 `sleep_window` 这类结构性参数需要重载才生效。
@@ -288,4 +334,4 @@ python -m pytest tests -q
 
 ## 许可
 
-AGPL v3，见 `LICENSE`。原始设计与实现 © orge-8（[life-frequency](https://github.com/orge-8/life-frequency)）（MIT）。
+MIT，见 `LICENSE`。原始设计与实现 © orge-8（[life-frequency](https://github.com/orge-8/life-frequency)）。
