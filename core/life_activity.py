@@ -578,6 +578,8 @@ class ActivityFacts:
     sick: bool = False
     sleep_minutes_today: int = 0
     awake_minutes_today: int = 0
+    #: 本生活日已经打过的**时段外**小睡次数（时段内入睡不计）。
+    naps_today: int = 0
     #: 班表事实（``schedule_facts`` 算出）。默认值 = 未启用班表 = 不加任何额外限制，
     #: 所以老状态与既有测试的行为完全不变。
     schedule: ScheduleFacts = field(default_factory=ScheduleFacts)
@@ -596,6 +598,23 @@ class EnforcePolicy:
     #: 睡眠中体力恢复到上限且睡满最短时长就强制唤醒。默认开；关掉则回到
     #: 「模型提议醒 / 睡满每日上限」两条路。
     energy_full_wake: bool = True
+    #: 离开睡眠窗口就强制唤醒。
+    #:
+    #: ⚠ v1.7.0：在这之前，「睡眠窗口」只负责**允许入睡**，不负责**叫醒**。
+    #: 结果是她傍晚体力跌破阈值就睡下，然后一直睡到 ``max_sleep_hours``（12 小时）
+    #: ——用户设了 ``23:30-09:00``，实际却从 21:51 睡到次日近中午。
+    #: 窗口既然表达了「这段时间才是睡觉时间」，离开窗口就该醒。
+    wake_off_window: bool = True
+    #: 窗口外允许的「小睡」上限（分钟），默认 90。
+    #:
+    #: 语义（v1.7.1 按用户要求收紧）：**睡眠时段外不许直接开睡**，只允许
+    #: 「小睡」——每天最多 ``max_naps_per_day`` 次、每次最多这么多分钟。
+    #: 换句话说，``23:30-09:00`` 之外的任何时间都不能把一整觉睡过去
+    #: （例如 21:00 睡到早上是**不**允许的）。
+    #: 填 0 表示时段外完全不允许睡。
+    nap_minutes: int = 90
+    #: 时段外每天最多睡几次小睡，默认 1。
+    max_naps_per_day: int = 1
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
 
 
@@ -847,16 +866,6 @@ def parse_response(text: object, *, max_scene_chars: int = 40) -> ActivityDecisi
 # ---------------------------------------------------------------- 强制层
 
 
-def _sleep_allowed(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
-    """她现在是否有资格睡觉：睡眠时段内，或体力很低，或生病。"""
-
-    if facts.sick:
-        return True
-    if float(facts.energy) < float(policy.sleep_energy_threshold):
-        return True
-    return in_window(facts.now_minutes, policy.sleep_window)
-
-
 def _must_wake(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
     """睡太久了：单次连续睡眠或本生活日累计，任一到达上限就该醒。
 
@@ -903,6 +912,34 @@ def _energy_full_wake(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
     return float(facts.energy) >= float(facts.energy_cap)
 
 
+def _rested_enough(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
+    """体力已经足够饱，再睡也是空转。
+
+    与 ``_energy_full_wake`` 的区别只有一个余量：后者判定「此刻必须醒来」，
+    用满值精确比较；这里判定「**要不要送她回去睡**」，所以留一点余量。
+
+    ⚠ 为什么要余量（v1.7.1 真机实测 2026-10-20 05:00/05:10/05:20）：
+    体力 10.0 被 ``_energy_full_wake`` 叫醒 → 下一个 tick ``settle`` 扣掉 0.1 变成
+    9.9 → ``_energy_full_wake`` 不再成立 → 硬约束又把她送回床上 → 睡 10 分钟
+    体力回到 10.0 → 再叫醒……状态卡每 10 分钟闪一次「睡觉/日常」。
+    留余量后，9.9 就算「睡够了」，不会再被送回去。
+    """
+
+    margin = max(0.5, float(facts.energy_cap) * 0.05)
+    return float(facts.energy) >= float(facts.energy_cap) - margin
+
+
+def _slept_enough_today(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
+    """今天这一觉是不是已经睡够了（今天累计睡眠已达最短时长）。
+
+    用来切断「体力满被叫醒 → 体力自然下降 → 又被送回床」的循环：既然今天已经
+    睡过一整觉，就不该再因为「现在在睡眠时段内」被系统强行送回床上。
+    模型明确提议睡觉时不受这条限制（那是她自己的意愿）。
+    """
+
+    return int(facts.sleep_minutes_today) >= int(policy.min_sleep_minutes)
+
+
 def _awake_floor_ok(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
     """今日清醒够不够；不够就不许入睡（防止模型一累就让她睡）。
 
@@ -913,6 +950,101 @@ def _awake_floor_ok(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
     """
 
     return facts.awake_minutes_today >= policy.min_awake_hours_per_day * 60.0
+
+
+def _in_sleep_window(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
+    """此刻是否落在配置的睡眠窗口里。"""
+
+    return in_window(facts.now_minutes, policy.sleep_window)
+
+
+def _slept_through_window_end(
+    facts: ActivityFacts, policy: EnforcePolicy
+) -> tuple[bool, str]:
+    """这次睡眠是不是**跨过了窗口结束时刻**（即本来该在窗口内睡、现在已出窗口）。
+
+    用「睡了多久」反推她是几点睡下的：
+    睡下时刻 = now - minutes_in_sleep。若睡下时在窗口内、而现在不在，就说明
+    她是「正常睡眠跨出窗口」，该醒。
+
+    反之，若睡下时就已经在窗口外（体力跌破阈值打盹），那是小睡，
+    交给 ``_nap_expired`` 按时限管，不要立刻把她叫起来。
+
+    Returns:
+        ``(是否该醒, 原因)``。
+    """
+
+    if not policy.wake_off_window:
+        return False, ""
+    if facts.sick:
+        return False, ""
+    if _in_sleep_window(facts, policy):
+        return False, ""
+
+    slept = max(int(facts.minutes_in_sleep), int(facts.minutes_in_activity))
+    if slept <= 0:
+        # 不知道睡了多久：宁可相信「刚睡下」，交给小睡时限管
+        return False, ""
+
+    fell_asleep_at = (int(facts.now_minutes) - slept) % 1440
+    if _in_sleep_window_at(fell_asleep_at, policy):
+        return True, "已离开睡眠窗口"
+    return False, ""
+
+
+def _in_sleep_window_at(now_minutes: int, policy: EnforcePolicy) -> bool:
+    """某个时刻是否落在睡眠窗口里（用于反推入睡时刻）。"""
+
+    return in_window(now_minutes, policy.sleep_window)
+
+
+def _nap_expired(facts: ActivityFacts, policy: EnforcePolicy) -> tuple[bool, str]:
+    """窗口外那一觉的小睡时限到了没。
+
+    只约束**在窗口外睡下**的那一觉；窗口内正常入睡的不受它管。
+    生病时不限时（养病优先）。
+    """
+
+    if facts.sick or policy.nap_minutes <= 0:
+        return False, ""
+    if _in_sleep_window(facts, policy):
+        return False, ""
+    slept = max(int(facts.minutes_in_sleep), int(facts.minutes_in_activity))
+    if slept < int(policy.nap_minutes):
+        return False, ""
+    return True, f"时段外小睡已满 {policy.nap_minutes} 分钟"
+
+
+def _nap_quota_used_up(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
+    """今天的小睡名额是不是已经用完了（时段外）。"""
+
+    return int(facts.naps_today) >= int(policy.max_naps_per_day)
+
+
+def _sleep_allowed(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
+    """她现在是否可以**入睡**。
+
+    规则（v1.7.1，按用户要求）：
+
+    * 睡眠时段内 → 可以睡（正常睡眠）；
+    * 生病 → 可以睡（养病优先，不占小睡名额）；
+    * 时段外 + 体力跌破阈值 → 只能**小睡**：本次 90 分钟封顶，
+      且今天的小睡名额（默认 1 次）还没用完。
+
+    ⚠ 时段外**不再允许直接开睡**。旧逻辑是「体力低就能睡」，于是她 21:00
+    体力一掉就睡到早上，等于把整个夜晚睡眠提前了——那不是小睡，是绕开时段。
+    """
+
+    if facts.sick:
+        return True
+    if _in_sleep_window(facts, policy):
+        return True
+    # 时段外：只有体力很低、今天还没用小睡名额、且小睡上限没设成 0 时才能小睡
+    if float(facts.energy) < float(policy.sleep_energy_threshold):
+        if int(policy.nap_minutes) <= 0:
+            return False
+        return not _nap_quota_used_up(facts, policy)
+    return False
 
 
 def _wake_target(facts: ActivityFacts) -> str:
@@ -961,6 +1093,14 @@ def enforce(
                 _wake_target(facts), "", SOURCE_ENFORCED,
                 f"体力已满（{facts.energy:.1f}/{facts.energy_cap:.1f}），强制唤醒",
             )
+        # 窗口边界与小睡上限优先于「最短睡眠时长」：最短时长保护的是
+        # 「别刚睡下就被叫醒」，不能用来让她睡过整个白天。
+        wake_now, wake_why = _slept_through_window_end(facts, policy)
+        if wake_now:
+            return ActivityDecision(_wake_target(facts), "", SOURCE_ENFORCED, wake_why)
+        nap_done, nap_why = _nap_expired(facts, policy)
+        if nap_done:
+            return ActivityDecision(_wake_target(facts), "", SOURCE_ENFORCED, nap_why)
         if requested is None or requested == SLEEP:
             return ActivityDecision(SLEEP, scene, source, "仍在睡眠，保持")
         if facts.minutes_in_activity < policy.min_sleep_minutes:
@@ -988,14 +1128,27 @@ def enforce(
         # 所以先判一次入睡条件，够格就直接送她睡（与分支 1 的 ``_must_wake`` 对称）。
         # 缺了这一步，模型一挂她就永远卡在当前活动里，只能等 ``reseed_after_hours``
         # （默认 24 小时）被时段表救出来。
-        if _sleep_allowed(facts, policy) and (
+        #
+        # ⚠ 体力已满时不要再送她睡：``_energy_full_wake`` 会在下一个 tick 立刻
+        # 把她叫起来，于是形成「睡下 → 唤醒 → 再睡下」的抖动（真机实测
+        # 2026-10-20 05:00/05:10/05:20 连跳）。睡了也恢复不了任何东西。
+        #
+        # 更根本的一条：**硬约束只在「真的需要睡」时才送她睡**。
+        # 「现在在睡眠时段内」本身不足够——今天已经睡够一整觉、或体力还很饱时，
+        # 光凭时段把她从活动里拽回床上，会形成 睡下→体力满唤醒→自然掉一点→
+        # 又被送回去 的循环（真机实测 2026-10-20 05:00-09:00 反复跳）。
+        # 模型明确提议 `sleep` 时走下面的 2b 分支，不受这条限制。
+        needs_sleep = (
+            not _rested_enough(facts, policy)
+            and not _slept_enough_today(facts, policy)
+        )
+        if needs_sleep and _sleep_allowed(facts, policy) and (
             urgent_sleep or _awake_floor_ok(facts, policy)
         ):
             return ActivityDecision(
                 SLEEP, "", SOURCE_ENFORCED, "无有效决策，但她已到入睡条件，硬约束送她入睡"
             )
         return ActivityDecision(current, scene, SOURCE_RETAINED, "无有效决策，保持当前活动")
-
     # ---- 2a) 班表相容：作息骨架由确定性层守住 ----
     # 放在「生病」与「无提议」之后、睡眠/切换判定之前：它要能压住「睡到上班迟到」
     # 与「在岗打游戏」这类提议，但健康与「模型没输出」的优先级都高于它。
@@ -1021,10 +1174,17 @@ def enforce(
                 f"今日清醒不足 {policy.min_awake_hours_per_day:g} 小时，拒绝入睡",
             )
         if not _sleep_allowed(facts, policy):
-            return ActivityDecision(
-                current, scene, SOURCE_ENFORCED,
-                "不在睡眠时段且体力不低，先不睡",
-            )
+            if _in_sleep_window(facts, policy):
+                reason = "不在睡眠时段且体力不低，先不睡"
+            elif _nap_quota_used_up(facts, policy):
+                reason = (
+                    f"不在睡眠时段，今天的小睡名额（{policy.max_naps_per_day} 次）已用完"
+                )
+            elif int(policy.nap_minutes) <= 0:
+                reason = "不在睡眠时段，且已禁用时段外小睡"
+            else:
+                reason = "不在睡眠时段且体力不低，先不睡"
+            return ActivityDecision(current, scene, SOURCE_ENFORCED, reason)
         return ActivityDecision(SLEEP, scene, source, "入睡")
 
     # ---- 2b) 普通切换：受最短停留时间约束 ----
@@ -1057,6 +1217,13 @@ def request_is_pointless(facts: ActivityFacts, policy: EnforcePolicy) -> str:
             return "已睡够上限，本轮必然强制唤醒"
         if _energy_full_wake(facts, policy):
             return "体力已满，本轮必然强制唤醒"
+        # 窗口边界 / 小睡上限也必然唤醒，与 enforce 的分支顺序保持一致
+        wake_now, wake_why = _slept_through_window_end(facts, policy)
+        if wake_now:
+            return f"{wake_why}，本轮必然强制唤醒"
+        nap_done, nap_why = _nap_expired(facts, policy)
+        if nap_done:
+            return f"{nap_why}，本轮必然强制唤醒"
         if facts.minutes_in_activity < policy.min_sleep_minutes:
             return f"本次睡眠未满 {policy.min_sleep_minutes} 分钟，本轮必然继续睡"
         return ""
@@ -1065,8 +1232,14 @@ def request_is_pointless(facts: ActivityFacts, policy: EnforcePolicy) -> str:
     # 生病时「睡」与「养病」都合法，问一次有意义
     if facts.sick:
         return ""
-    # 够格入睡 ⇒ 没提议时硬约束会送她睡、提议 sleep 也会被接受 ⇒ 有意义
-    if _sleep_allowed(facts, policy):
+    # 够格入睡 ⇒ 没提议时硬约束会送她睡、提议 sleep 也会被接受 ⇒ 有意义。
+    # ⚠ 体力已满时反而不够格（enforce 会拒绝送她睡以免抖动），所以要把这条排除掉，
+    # 否则「跳过提问」与「问了」的结论会对不上。
+    if (
+        _sleep_allowed(facts, policy)
+        and not _rested_enough(facts, policy)
+        and not _slept_enough_today(facts, policy)
+    ):
         return ""
     # 未满停留期 ⇒ 任何「换活动」的提议都会被否掉；而此刻又不会睡 ⇒ 只能保持当前活动
     if facts.minutes_in_activity < policy.min_dwell_minutes:

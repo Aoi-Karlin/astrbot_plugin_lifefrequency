@@ -31,6 +31,7 @@ from .life_activity import (
     SOURCE_SKIPPED,
     ActivityDecision,
     ActivityFacts,
+    in_window,
     EnforcePolicy,
     ScheduleConfig,
     enforce,
@@ -229,6 +230,17 @@ class SimConfig:
     #: 体力满了继续躺只是空转，真机实测她带着 10.0/10 又睡了 73 分钟）。
     #: 默认开；关掉则回到「模型提议醒 / 睡满每日上限」两条路。
     energy_full_wake: bool = True
+    #: 离开睡眠窗口就强制唤醒（v1.7.0）。
+    #:
+    #: 在这之前，睡眠窗口只负责「允许入睡」、不负责「叫醒」：她傍晚体力跌破阈值
+    #: 睡下后会一路睡到 ``max_sleep_hours``（12 小时）。用户设 ``23:30-09:00``，
+    #: 实际却从 21:51 睡到次日近中午——窗口形同虚设。
+    wake_off_window: bool = True
+    #: 时段外**不许直接开睡**，只允许小睡；这是单次小睡的分钟上限。
+    #: 填 0 表示时段外完全不许睡。
+    nap_minutes: int = 90
+    #: 时段外每天最多能睡几次小睡，默认 1（「每天最多一次」）。
+    max_naps_per_day: int = 1
     #: 睡眠中被 ``@`` 时是否开一个短暂清醒窗口（``simulation.wake_on_at``）。
     #: 关掉 = 「睡着连 @ 都不回」；开着则窗口内倍率按清醒算，让她这一次真的能回话。
     #: 窗口长度见 ``wake_minutes``。为什么需要它见 ``LifeState.at_wake_until`` 的说明。
@@ -427,6 +439,9 @@ def build_enforce_policy(config: SimConfig) -> EnforcePolicy:
         min_dwell_minutes=config.min_dwell_minutes,
         min_sleep_minutes=config.min_sleep_minutes,
         energy_full_wake=config.energy_full_wake,
+        wake_off_window=config.wake_off_window,
+        nap_minutes=config.nap_minutes,
+        max_naps_per_day=config.max_naps_per_day,
         schedule=config.schedule,
     )
 
@@ -590,6 +605,11 @@ class LifeState:
     sleep_minutes_today: int = 0
     awake_minutes_today: int = 0
     sleep_debt_nights: int = 0
+    #: 本生活日**在睡眠时段外**打过几次小睡（v1.7.0）。
+    #:
+    #: 「时段外可以小睡，但每天最多一次」需要一个按生活日清零的计数器；
+    #: 睡在时段内的不算小睡，不记在这里。由 ``settle`` 在跨日时清零。
+    naps_today: int = 0
     #: 最近若干段**已结束**的睡眠：``[{"start": 入睡时刻, "end": 醒来时刻,
     #: "minutes": 分钟数}, ...]``（``start`` / ``end`` 为权威字段，按与窗口的
     #: 交集求和；``minutes`` 只是给人看）。「这一觉睡够没有」按最近 24 小时的
@@ -787,6 +807,13 @@ def health_label(state: LifeState, now: float, config: SimConfig) -> str:
     return "健康"
 
 
+def _in_window(now: float, config: SimConfig) -> bool:
+    """``now`` 是否落在配置的睡眠时段内（按本地时间判定）。"""
+
+    local_now = local_datetime(now, config.tz_offset_minutes)
+    return in_window(local_now.hour * 60 + local_now.minute, config.sleep_window)
+
+
 def _minutes_since(now: float, anchor: object) -> int:
     """``anchor`` 到 ``now`` 的分钟数；锚点不可信（<=0 或在未来）时返回 0。
 
@@ -821,6 +848,7 @@ def activity_facts(state: LifeState, now: float) -> ActivityFacts:
         sick=is_cold(state, now),
         sleep_minutes_today=state.sleep_minutes_today,
         awake_minutes_today=state.awake_minutes_today,
+        naps_today=state.naps_today,
     )
 
 
@@ -1122,6 +1150,7 @@ def _skip_offline_gap(
     if crossed:
         state.sleep_minutes_today = 0
         state.awake_minutes_today = 0
+        state.naps_today = 0
         # 不判新的一夜，但按**已知的**熬夜天数把体力上限重新夹一次，
         # 免得停机期间一直挂着旧的（可能更严的）上限。
         _refresh_energy_cap(state, config)
@@ -1243,6 +1272,7 @@ def _settle_day(state: LifeState, config: SimConfig) -> None:
 
     state.sleep_minutes_today = 0
     state.awake_minutes_today = 0
+    state.naps_today = 0
     _refresh_energy_cap(state, config)
 
 
@@ -1354,6 +1384,11 @@ def apply_activity(
     if changed:
         if decision.activity == SLEEP:
             state.sleep_started_at = now
+            # 时段外睡下的算「小睡」，占用当天名额；时段内入睡不占。
+            # 名额在**入睡那一刻**扣，而不是醒来时——否则中途跨日会漏记，
+            # 而且「今天还能不能睡」在入睡时才有意义。
+            if not _in_window(now, config):
+                state.naps_today = int(state.naps_today) + 1
         elif previous == SLEEP:
             # 先量这一觉再清锚点。量不到（旧状态没有 sleep_started_at）时退回当日累计：
             # 那是唯一能用的证据，而且它不能同时进账本，否则会重复计。
