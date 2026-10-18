@@ -969,6 +969,39 @@
         "default": "",
         "hint": "主动开口时用哪个模型润色。留空则跟随活动决策模型 / 当前会话模型。"
       },
+      "summary_turns": {
+        "description": "先用小模型总结最近几轮",
+        "type": "int",
+        "default": 25,
+        "hint": "一轮=一问一答。总结成 1~3 句「他们最近在聊什么」交给主模型，避免只看几条就断章取义。填 0 关闭总结。"
+      },
+      "summary_provider_id": {
+        "description": "总结用的模型",
+        "type": "string",
+        "_special": "select_provider",
+        "default": "",
+        "hint": "建议选便宜的小模型。留空就不做总结（不会偷偷用贵的那个多花一次钱）。"
+      },
+      "summary_on_fail": {
+        "description": "总结失败时",
+        "type": "string",
+        "default": "skip",
+        "options": [
+          "skip",
+          "block"
+        ],
+        "labels": [
+          "跳过总结，照样开口",
+          "放弃这次开口"
+        ],
+        "hint": "超时、报错、或模型返回空都算失败。"
+      },
+      "context_messages": {
+        "description": "最近几条原话",
+        "type": "int",
+        "default": 10,
+        "hint": "摘要会丢语气和细节，留几条原话当参照。填 0 关闭。"
+      },
       "score_threshold": {
         "description": "开口分数阈值",
         "type": "float",

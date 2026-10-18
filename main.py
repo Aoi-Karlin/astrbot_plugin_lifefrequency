@@ -49,6 +49,7 @@ from .core import life_economy as E
 from .core import life_events as EV
 from .core import life_factors as F
 from .core import life_gate as G
+from .core import life_context as CX
 from .core import life_memory as M
 from .core import life_proactive as P
 from .core import life_proactive_test as PT
@@ -947,6 +948,156 @@ class LifeFrequencyPlugin(Star):
             logger.warning(f"[{PLUGIN_NAME}] 主动开口未发出（{umo}）：{reason}")
         return ok
 
+    async def _conversation_context(self, umo: str, now: float) -> CX.ContextBundle:
+        """取本会话最近的对话，供主动开口「接着话头说」。
+
+        分三段拿：
+
+        1. 拿 ``summary_turns`` 轮对话交给**总结模型**压成几句话；
+        2. 拿最近 ``context_messages`` 条原话当参照；
+        3. 读 ``last_proactive_at`` / ``last_user_message_at`` 算出隔了多久。
+
+        用 AstrBot 自己的 ``get_human_readable_context``：它已经处理了 ``history``
+        的 JSON 解析、role 区分与工具调用占位，没必要自己再解析一遍。
+
+        ⚠ 它的分页是**从最早开始**的（page=1 最旧），所以要拿最近的必须
+        先取总页数再翻到最后一页。
+
+        任何一步取不到都返回可用的部分——**没有上下文也能开口**，只是会呆一点，
+        不能因为读不到历史就干脆不开这个口。
+        """
+        sec = CA.section(self.conf, "proactive")
+        limit = CA.integer(sec, "context_messages", 10)
+        turns = CA.integer(sec, "summary_turns", 25)
+        gap_text = self._proactive_gap_text(umo, now)
+
+        def _bundle(lines=None, summary="", reason="") -> CX.ContextBundle:
+            return CX.ContextBundle(
+                lines=list(lines or []), summary=summary, gap_text=gap_text,
+                empty_reason=reason,
+            )
+
+        if limit <= 0 and turns <= 0:
+            return _bundle(reason="上下文已关闭")
+
+        try:
+            manager = getattr(self.context, "conversation_manager", None)
+            if manager is None:
+                return _bundle(reason="拿不到 conversation_manager")
+            cid = await manager.get_curr_conversation_id(umo)
+            if not cid:
+                return _bundle(reason="这个会话还没有建立对话记录")
+
+            # 一次多取一些：总结要的范围比「最近几条」大
+            want_lines = max(limit, turns * 2, 1)
+            lines = await self._tail_context(manager, umo, cid, want_lines)
+        except Exception:  # noqa: BLE001 —— 读不到历史也要能开口
+            logger.debug(f"[{PLUGIN_NAME}] 读取对话上下文失败（{umo}）", exc_info=True)
+            return _bundle(reason="读取对话记录失败")
+
+        recent = CX.build_bundle(lines, limit=limit) if limit > 0 else CX.ContextBundle()
+        summary, block = await self._summarize_context(umo, lines, turns)
+        if block:
+            # 配置要求「没总结就不发」——这是唯一会主动放弃开口的上下文原因
+            return CX.ContextBundle(
+                gap_text=gap_text,
+                empty_reason="总结对话失败（summary_on_fail=block）",
+                abort=True,
+            )
+
+        return _bundle(
+            lines=recent.lines,
+            summary=summary,
+            reason="" if (recent.lines or summary or gap_text) else recent.empty_reason,
+        )
+
+    async def _tail_context(
+        self, manager: Any, umo: str, cid: str, count: int
+    ) -> list[str]:
+        """取这个会话**最近** ``count`` 条，按时间正序返回。
+
+        ``get_human_readable_context`` 的 page 从最早算起，所以要先把总页数
+        试出来再翻到最后一页。页数变了（期间有人说话）就重试一次。
+        """
+        page_size = max(1, int(count))
+        for _ in range(2):
+            lines, pages = await manager.get_human_readable_context(
+                umo, cid, page=1, page_size=page_size
+            )
+            pages = max(1, int(pages or 1))
+            last, pages_now = await manager.get_human_readable_context(
+                umo, cid, page=pages, page_size=page_size
+            )
+            if pages_now == pages:
+                return last
+            # 期间新增了页，用新的页数再来一次
+        return last
+
+    async def _summarize_context(
+        self, umo: str, lines: list[str], turns: int
+    ) -> tuple[str, bool]:
+        """用小模型把最近 ``turns`` 轮对话压成几句话。
+
+        Returns:
+            ``(摘要, 是否应该因此放弃这次开口)``。第二个值为 True 只在
+            ``summary_on_fail=block`` 且总结失败时出现。没配总结模型、没有历史、
+            或 ``turns<=0`` 都直接返回 ``("", False)``——那不是失败，是没要求。
+        """
+        sec = CA.section(self.conf, "proactive")
+        summary_provider = CA.text(sec, "summary_provider_id")
+        if not summary_provider:
+            return "", False
+        if not lines or turns <= 0:
+            return "", False
+
+        # 一轮≈一问一答两条
+        window = lines[-max(1, turns * 2) :]
+        on_fail = CA.text(sec, "summary_on_fail", "skip") or "skip"
+        prompt = (
+            "把下面这段群聊压缩成 1~3 句中文，说明「他们最近在聊什么、有没有人需要被关心」。\n"
+            "只输出那几句话，不要开场白、不要列表、不要引号。\n\n"
+            + "\n".join(window)
+        )
+        try:
+            response = await self.context.llm_generate(
+                chat_provider_id=summary_provider,
+                prompt=prompt,
+                temperature=0.3,
+                max_tokens=300,
+            )
+            summary = CX.clean_summary(
+                str(getattr(response, "completion_text", "") or "")
+            )
+            if summary:
+                return summary, False
+            # 返回空也算失败（比如被内容审核拦了）
+            return "", on_fail == "block"
+        except Exception:  # noqa: BLE001
+            logger.debug(f"[{PLUGIN_NAME}] 总结对话失败（{umo}）", exc_info=True)
+            return "", on_fail == "block"
+
+    def _proactive_gap_text(self, umo: str, now: float) -> str:
+        """距上次主动搭话多久。
+
+        取「上次真的发出去」与「上次想开口」两者中**较晚**的那个——被拦下的
+        那次也算她惦记过，不该让她把十分钟说成十天。
+        """
+        try:
+            record = self._sessions().get(umo) or {}
+            if not isinstance(record, dict):
+                return ""
+            last_sent = record.get("last_proactive_at") or 0.0
+            last_user = record.get("last_user_message_at") or 0.0
+            try:
+                mark = max(float(last_sent), float(last_user))
+            except (TypeError, ValueError):
+                return ""
+            if mark <= 0:
+                return ""
+            return CX.format_gap(float(now) - mark)
+        except Exception:  # noqa: BLE001
+            return ""
+
     async def _send_proactive_detailed(
         self, umo: str, decision: P.ProactiveDecision, now: float
     ) -> tuple[bool, str]:
@@ -959,12 +1110,33 @@ class LifeFrequencyPlugin(Star):
         text = str(material.get("text", "") or "").strip()
         if not text:
             return False, "这条素材没有正文"
-        prompt = (
-            f"【想跟对方说的话】{text}\n"
-            f"【开口的理由】{decision.intent or '主动关心一下'}\n"
-            "要求：用一两句口语把这句心里话说出来，符合人设与此刻的状态；"
-            "不要解释这是谁安排的，不要用列表，不要提到「素材」「任务」这类词。"
-        )
+
+        bundle = await self._conversation_context(umo, now)
+        if bundle.abort:
+            return False, bundle.empty_reason or "上下文不可用，按配置放弃这次开口"
+        parts = [
+            f"【想跟对方说的话】{text}",
+            f"【开口的理由】{decision.intent or '主动关心一下'}",
+        ]
+        if bundle.available:
+            parts.append(bundle.as_prompt_block())
+            rule = (
+                "要求：顺着上面这段对话自然接一句，用一两句口语把这句心里话说出来，"
+                "符合人设与此刻的状态；不要重复对方刚说过的话，不要解释这是谁安排的，"
+                "不要用列表，不要提到「素材」「任务」「总结」这类词。"
+            )
+            if bundle.gap_text:
+                rule += (
+                    "「距上次主动搭话」只用来定语气：隔得久可以显得想念，"
+                    "刚说过话就别做久别重逢的样子；不要把时间数字念出来。"
+                )
+            parts.append(rule)
+        else:
+            parts.append(
+                "要求：用一两句口语把这句心里话说出来，符合人设与此刻的状态；"
+                "不要解释这是谁安排的，不要用列表，不要提到「素材」「任务」这类词。"
+            )
+        prompt = "\n".join(parts)
         try:
             provider_id = self._default_provider_id("proactive", umo)
             if not provider_id:
