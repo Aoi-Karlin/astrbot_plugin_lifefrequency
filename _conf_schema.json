@@ -90,6 +90,34 @@
         "default": "03:00-11:00",
         "hint": "格式 HH:MM-HH:MM。她在这个窗口内、体力低于阈值时会去睡。"
       },
+      "wake_off_window": {
+        "description": "离开睡觉时段就醒",
+        "type": "bool",
+        "default": true,
+        "hint": "关掉的话，她只在睡满上限或体力回满时才会醒——可能出现「傍晚睡下、一直睡到中午」。建议保持开启。"
+      },
+      "nap_minutes": {
+        "description": "时段外小睡时长（分钟）",
+        "type": "int",
+        "default": 90,
+        "slider": {
+          "min": 0,
+          "max": 480,
+          "step": 30
+        },
+        "hint": "睡眠时段之外不许直接睡，只允许小睡，单次最多这么久。填 0 = 时段外完全不许睡。"
+      },
+      "max_naps_per_day": {
+        "description": "时段外每天最多小睡几次",
+        "type": "int",
+        "default": 1,
+        "slider": {
+          "min": 0,
+          "max": 5,
+          "step": 1
+        },
+        "hint": "默认 1 次。这样她不会在 21:00 直接睡到早上——那不算小睡。"
+      },
       "sleep_energy_threshold": {
         "description": "睡觉体力阈值",
         "type": "float",
