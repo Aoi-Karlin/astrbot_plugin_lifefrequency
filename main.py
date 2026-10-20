@@ -34,6 +34,7 @@ import math
 import os
 import random
 import time
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Mapping
@@ -53,6 +54,7 @@ from .core import life_context as CX
 from .core import life_memory as M
 from .core import life_proactive as P
 from .core import life_proactive_test as PT
+from .core import life_registry as REG
 from .core import life_sim as S
 from .core import render as R
 
@@ -122,7 +124,11 @@ class LifeFrequencyPlugin(Star):
         self.conf: dict[str, Any] = dict(config) if config is not None else {}
         self._warned: set[str] = set()
 
-        self.plugin_enabled = bool(CA.flag(CA.section(self.conf, "plugin"), "enabled", True))
+        plugin_sec = CA.section(self.conf, "plugin")
+        self.plugin_enabled = bool(CA.flag(plugin_sec, "enabled", True))
+        """群聊总开关：关掉后群里完全不介入（不拦、不注入、不主动开口）。"""
+        self.plugin_enabled_private = bool(CA.flag(plugin_sec, "enabled_private", True))
+        """私聊总开关。两边都关才停后台循环；只开一边时循环照常跑。"""
         self.dry_run = bool(CA.flag(CA.section(self.conf, "simulation"), "dry_run", False))
         self.state_dir = Path(self._resolve_data_dir())
         self.state_path = self.state_dir / STATE_FILENAME
@@ -140,6 +146,9 @@ class LifeFrequencyPlugin(Star):
 
         self._config_ok = True
         self._boot_error = ""
+        self._registry = REG.StateRegistry()
+        self._active: tuple[str, S.LifeState] | None = None
+        """当前正在处理的状态（键, 状态）；``None`` = 用群聊共用的那份。"""
         try:
             self._load_and_build()
         except Exception as exc:  # noqa: BLE001 —— 配置写坏不许拖垮插件加载
@@ -148,7 +157,9 @@ class LifeFrequencyPlugin(Star):
             self.sim_config = S.SimConfig()
             self.factor_config = F.FactorConfig()
             self.proactive_config = P.ProactiveConfig()
-            self.state = S.new_state(now=_now(), config=self.sim_config)
+            self._registry = REG.StateRegistry(
+                S.new_state(now=_now(), config=self.sim_config)
+            )
             self._event_library = tuple(EV.BUILTIN_EVENTS)
             logger.error(
                 f"[{PLUGIN_NAME}] 配置加载失败，插件将以最低配置空转：{self._boot_error}",
@@ -165,10 +176,23 @@ class LifeFrequencyPlugin(Star):
 
     # ------------------------------------------------------------ 生命周期
 
+    def _enabled_for(self, umo: str) -> bool:
+        """这个会话是否启用插件：群聊看 ``enabled``，私聊看 ``enabled_private``。"""
+
+        return self.plugin_enabled_private if not self._umo_is_group(umo) else self.plugin_enabled
+
+    def _any_enabled(self) -> bool:
+        """是否至少有一边开着——只有两边都关才停后台循环。"""
+
+        return self.plugin_enabled or self.plugin_enabled_private
+
     async def initialize(self) -> None:
-        """插件激活后启动后台生活循环（配置有误或已禁用时不启动）。"""
-        if not self.plugin_enabled:
-            logger.info(f"[{PLUGIN_NAME}] plugin.enabled=false，后台循环不启动。")
+        """插件激活后启动后台生活循环（配置有误或两边都禁用时不启动）。"""
+        if not self._any_enabled():
+            logger.info(
+                f"[{PLUGIN_NAME}] plugin.enabled 与 plugin.enabled_private 都为 false，"
+                "后台循环不启动。",
+            )
             return
         if not self._config_ok:
             logger.error(
@@ -266,11 +290,11 @@ class LifeFrequencyPlugin(Star):
         now = _now()
         loaded = self._read_state_file()
         if loaded is None:
-            self.state = S.new_state(now=now, config=self.sim_config)
+            self._registry = REG.StateRegistry(S.new_state(now=now, config=self.sim_config))
             self._save_state()
             logger.info(f"[{PLUGIN_NAME}] 没有可用状态文件，已按初始状态新建。")
         else:
-            self.state = loaded
+            self._registry = loaded
 
     def _build_event_library(self) -> tuple[EV.LifeEvent, ...]:
         """内建事件库 + ``events.extra`` 追加 − ``events.disabled`` 禁用。"""
@@ -286,12 +310,81 @@ class LifeFrequencyPlugin(Star):
 
     # ------------------------------------------------------------ 状态读写
 
-    def _read_state_file(self) -> S.LifeState | None:
+    @property
+    def state(self) -> S.LifeState:
+        """**当前**正在处理的那份生活状态。
+
+        默认是群聊共用的那份；在 ``_active_state`` 里推进私聊状态时，它会临时指向
+        私聊的那一份。任何与会话相关的逻辑都应该先用 ``_state_for_event`` 选好状态。
+        """
+        active = getattr(self, "_active", None)
+        if active is not None:
+            return active[1]
+        return self._registry.group
+
+    @state.setter
+    def state(self, value: S.LifeState) -> None:
+        active = getattr(self, "_active", None)
+        if active is not None:
+            key = active[0]
+            self._registry.put(key, value)
+            self._active = (key, value)
+        else:
+            self._registry.put(REG.GROUP_STATE_KEY, value)
+
+    def _state_key_for_umo(self, umo: str, *, is_group: bool, user_id: str = "") -> str:
+        """会话 → 状态键（群聊统一，私聊按用户分开）。"""
+
+        return REG.key_for_umo(umo, is_group=is_group, user_id=user_id)
+
+    def _state_for_umo(self, umo: str, *, user_id: str = "") -> S.LifeState:
+        """按 umo 取状态；私聊会话首次出现时懒创建。"""
+
+        return self._registry_for_umo(umo, user_id=user_id)[1]
+
+    def _registry_for_umo(
+        self, umo: str, *, user_id: str = ""
+    ) -> tuple[str, S.LifeState]:
+        """按 umo 取 (状态键, 状态)，私聊首次出现时懒创建。
+
+        群聊一律落到共用的那份；取不到 umo 时退回群聊那份（宁可读错也不崩）。
+        """
+
+        umo = str(umo or "")
+        if not umo:
+            return REG.GROUP_STATE_KEY, self._registry.group
+        is_group = self._umo_is_group(umo)
+        key = self._state_key_for_umo(
+            umo, is_group=is_group, user_id="" if is_group else (user_id or umo)
+        )
+        state = self._registry.get(key)
+        if state is None:
+            state = self._registry.ensure(key, now=_now(), config=self.sim_config)
+            if REG.is_private_key(key):
+                logger.info(f"[{PLUGIN_NAME}] 为私聊新建独立生活状态：{key}")
+        return key, state
+
+    def _state_for_event(self, event: AstrMessageEvent) -> S.LifeState:
+        """按事件取状态：私聊各自一套，群聊共用一套。"""
+
+        return self._state_for_umo(self._safe_umo(event), user_id=self._sender_of(event))
+
+    @staticmethod
+    def _sender_of(event: AstrMessageEvent) -> str:
+        """取发送者 id；拿不到就返回空串（调用方会退回用 umo 区分）。"""
+
+        try:
+            return str(getattr(event, "get_sender_id", lambda: "")() or "")
+        except Exception:  # noqa: BLE001 —— 各平台实现的差异，不值得让消息处理失败
+            return ""
+
+    def _read_state_file(self) -> REG.StateRegistry | None:
         """读取状态文件：先主线，坏了再退到备份。
 
         注意备份的语义是「**上一次**成功保存的内容」，所以它天生比主线旧一个版本。
         这条路径只用于主线损坏（断电、磁盘满、手改成半截 JSON）时别丢她的一生。
         """
+        now = _now()
         for path in (self.state_path, self.backup_path):
             if not path.exists():
                 continue
@@ -303,7 +396,9 @@ class LifeFrequencyPlugin(Star):
                     self._quarantine_state_file(exc)
                 continue
             try:
-                state = S.LifeState.from_dict(raw)
+                registry = REG.StateRegistry.from_payload(
+                    raw, now=now, config=self.sim_config
+                )
             except Exception as exc:  # noqa: BLE001 —— 结构坏了也不许拖垮加载
                 logger.error(
                     f"[{PLUGIN_NAME}] 状态文件 {path.name} 结构异常（{exc}），已忽略",
@@ -312,9 +407,10 @@ class LifeFrequencyPlugin(Star):
             if path == self.backup_path:
                 logger.warning(
                     f"[{PLUGIN_NAME}] 已从备份 {path.name} 恢复"
-                    f"（活动={state.activity}，最后 tick={state.last_tick_at}）",
+                    f"（活动={registry.group.activity}，"
+                    f"私聊状态 {len(registry.private_items())} 份）",
                 )
-            return state
+            return registry
         return None
 
     def _quarantine_state_file(self, exc: Exception) -> None:
@@ -329,7 +425,7 @@ class LifeFrequencyPlugin(Star):
     def _save_state(self) -> None:
         """原子写状态：先写 ``.tmp`` 再 ``os.replace``，并留一份上一版备份。"""
         text = json.dumps(
-            self.state.to_dict(), ensure_ascii=False, indent=2, sort_keys=True
+            self._registry.to_payload(), ensure_ascii=False, indent=2, sort_keys=True
         )
         tmp = self.state_path.with_name("state.tmp")
         try:
@@ -372,15 +468,56 @@ class LifeFrequencyPlugin(Star):
                 logger.exception(f"[{PLUGIN_NAME}] 生活循环本轮出错，下一轮继续")
 
     async def _sim_tick(self, now: float) -> None:
-        """一轮推进：结算 → 问模型 → 强制层 → 重新取种子 → 经济 → 主动开口 → 落盘。
+        """一轮推进：依次推进群聊共用的那份 + 所有私聊那份。
 
         顺序与原版 ``_sim_tick`` 一致，唯一删掉的是「把倍率下发到宿主」——
         在 AstrBot 里这一步变成了来消息时的即时闸门判定。
+
+        多份状态的处理见 ``_tick_one``：群聊那份每轮都推进；私聊那份只有**活跃**
+        （最近说过话）才问模型，否则只用时段表/强制层推进，不花 token。
         """
         async with self._loop_lock:
             self._refresh_cheap_config()
+            for key in self._tickable_state_keys(now):
+                try:
+                    await self._tick_one(key, now)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 —— 一份状态出问题不许拖垮其他
+                    logger.exception(f"[{PLUGIN_NAME}] 推进状态 {key} 时出错，跳过")
+            self._save_state()
+
+    def _tickable_state_keys(self, now: float) -> list[str]:
+        """这一轮该推进哪些状态：群聊那份 + 活跃的私聊。
+
+        「活跃」的判据是 ``proactive.active_hours``（默认 24 小时）内说过话——
+        没人会聊的会话不必每 10 分钟花一次 token 问她"在干嘛"。
+
+        开关也按边生效：群聊关了就不停群聊那份（它反正没人看），私聊仍照常推进；
+        只开一边时循环也照跑——见 ``_any_enabled``。
+        """
+
+        keys = [REG.GROUP_STATE_KEY] if self.plugin_enabled else []
+        if not self.plugin_enabled_private:
+            return keys
+        window = max(1, int(CA.integer(CA.section(self.conf, "proactive"), "active_hours", 24)))
+        cutoff = now - window * 3600
+        for key, state in self._registry.private_items():
+            session = self._sessions().get(key) or {}
+            last_seen = float(session.get("last_user_at") or 0.0)
+            if last_seen >= cutoff or last_seen <= 0:
+                keys.append(key)
+        return keys
+
+    async def _tick_one(self, key: str, now: float) -> None:
+        """推进指定的那份状态。"""
+
+        state = self._registry.get(key) or self._registry.ensure(
+            key, now=now, config=self.sim_config
+        )
+        with self._active_state(state, key):
             self.state = S.settle(
-                self.state,
+                state,
                 now=now,
                 config=self.sim_config,
                 events=self._event_library,
@@ -394,14 +531,34 @@ class LifeFrequencyPlugin(Star):
             )
             self._maybe_reseed(now)
             await self._note_activity_memory(now, previous_activity)
-            await self._refresh_economy(now)
-            await self._maybe_proactive(now)
-            self._save_state()
+            if key == REG.GROUP_STATE_KEY:
+                # 经济与主动开口仍然按群聊那套口径跑一次，不因私聊状态翻倍
+                await self._refresh_economy(now)
+                await self._maybe_proactive(now)
             logger.debug(
-                f"[{PLUGIN_NAME}] tick：{R.activity_label(self.state.activity)}"
+                f"[{PLUGIN_NAME}] tick[{key}]：{R.activity_label(self.state.activity)}"
                 f"（{self.state.activity_source}）情绪 {self.state.emotion:.1f}"
                 f" 体力 {self.state.energy:.1f}",
             )
+
+    @contextmanager
+    def _active_state(self, state: S.LifeState, key: str):
+        """临时把「当前状态」指向指定那份，退出时还原。
+
+        这是为了**不必改一百处** ``self.state``：现有逻辑一律读写「当前状态」，
+        由这里决定当前是哪一份。群聊与私聊的差异只存在于「选哪份」这一步。
+        """
+
+        previous = getattr(self, "_active", None)
+        self._registry.put(key, state)
+        self._active = (key, state)
+        try:
+            yield state
+        finally:
+            current = self._registry.get(key)
+            if current is not None:
+                self._registry.put(key, current)
+            self._active = previous
 
     def _on_offline_gap(self, gap_minutes: int, crossed_boundary: bool) -> None:
         """停机间隙的日志回调（那段时间不记账，见 ``life_sim.settle``）。"""
@@ -894,14 +1051,12 @@ class LifeFrequencyPlugin(Star):
         local_now = S.local_datetime(now, self.sim_config.tz_offset_minutes)
         now_minutes = local_now.hour * 60 + local_now.minute
         day_key = S.day_key_of(local_now, self.sim_config.day_boundary_hour)
-        materials = S.active_materials(
-            self.state,
-            now,
-            floor=CA.num(CA.section(self.conf, "events"), "material_decay_floor", 0.25),
-        )
 
         for umo in list(self._sessions()):
             is_group = self._umo_is_group(umo)
+            # 群聊关掉就完全不在群里开口；私聊同理。
+            if not self._enabled_for(umo):
+                continue
             if not CA.scope_matches(
                 mode=scope_mode,
                 targets=targets,
@@ -911,22 +1066,30 @@ class LifeFrequencyPlugin(Star):
                 is_group=is_group,
             ):
                 continue
+            key, state = self._registry_for_umo(umo, user_id=self._user_id_of(umo))
+            materials = S.active_materials(
+                state,
+                now,
+                floor=CA.num(CA.section(self.conf, "events"), "material_decay_floor", 0.25),
+            )
             decision = P.decide(
                 config=config,
                 now=now,
                 now_minutes=now_minutes,
-                activity=self.state.activity,
-                energy=float(self.state.energy),
-                emotion=float(self.state.emotion),
+                activity=state.activity,
+                energy=float(state.energy),
+                emotion=float(state.emotion),
                 materials=materials,
                 session=self._sessions().get(umo),
                 day_key=day_key,
                 private_chat=not is_group,
             )
             if not decision.should_send:
-                P.bump_skip_ledger(self.state.skip_ledger, decision.reason_label)
+                P.bump_skip_ledger(state.skip_ledger, decision.reason_label)
                 continue
-            if await self._send_proactive(umo, decision, now):
+            with self._active_state(state, key):
+                sent = await self._send_proactive(umo, decision, now)
+            if sent:
                 P.record_proactive(
                     self._sessions(), stream_id=umo, now=now, day_key=day_key
                 )
@@ -1172,15 +1335,22 @@ class LifeFrequencyPlugin(Star):
         Args:
             event: 消息事件。
         """
-        if not self.plugin_enabled or not self._config_ok or event.is_stopped():
+        if not self._enabled_for(self._safe_umo(event)) or not self._config_ok:
+            return
+        if event.is_stopped():
             return
         now = _now()
-        outcome = self._gate_outcome(event, now)
-        if outcome is None:
-            return
-        if outcome.allow:
-            self._note_user_message(event, now)
-            return
+        # 私聊要用**这个人自己的**那份状态算倍率；群聊仍是共用的那份。
+        key, state = self._registry_for_umo(
+            self._safe_umo(event), user_id=self._sender_of(event)
+        )
+        with self._active_state(state, key):
+            outcome = self._gate_outcome(event, now)
+            if outcome is None:
+                return
+            if outcome.allow:
+                self._note_user_message(event, now)
+                return
         event.stop_event()
         yield
 
@@ -1407,7 +1577,10 @@ class LifeFrequencyPlugin(Star):
 
     @life.command("重置")
     async def life_reset(self, event: AstrMessageEvent):
-        """重置她的生活状态（活动重新按内置时段表取种子）。
+        """重置**当前会话**的生活状态（活动重新按内置时段表取种子）。
+
+        群聊里重置的是群聊共用的那份；私聊里只重置你自己的那份，
+        不会影响别人，也不会影响群聊。
 
         Args:
             event: 消息事件。
@@ -1415,13 +1588,17 @@ class LifeFrequencyPlugin(Star):
         if not self._is_admin(event):
             yield event.plain_result("只有管理员能重置她的生活状态。")
             return
-        self.state = S.new_state(now=_now(), config=self.sim_config)
-        self._gates.clear()
+        umo = self._safe_umo(event)
+        key, _ = self._registry_for_umo(umo, user_id=self._sender_of(event))
+        fresh = S.new_state(now=_now(), config=self.sim_config)
+        self._registry.put(key, fresh)
+        self._gates.pop(umo, None)
         self._save_state()
-        logger.info(f"[{PLUGIN_NAME}] 状态已重置（{self._safe_umo(event)}）")
+        scope = "群聊共用" if key == REG.GROUP_STATE_KEY else f"私聊 {key}"
+        logger.info(f"[{PLUGIN_NAME}] 状态已重置（{scope}｜{umo}）")
         yield event.plain_result(
-            f"已重置：当前活动 {R.activity_label(self.state.activity)}，"
-            f"情绪 {self.state.emotion:.1f}/10，体力 {self.state.energy:.1f}/10。",
+            f"已重置{scope}的那份：当前活动 {R.activity_label(fresh.activity)}，"
+            f"情绪 {fresh.emotion:.1f}/10，体力 {fresh.energy:.1f}/10。",
         )
 
     @life.command("测试主动")
@@ -1560,9 +1737,16 @@ class LifeFrequencyPlugin(Star):
         return hits
 
     def _render(self, renderer, event: AstrMessageEvent) -> str:
-        """渲染一张状态卡；任何异常都变成一句人话，而不是抛给用户。"""
+        """渲染一张状态卡；任何异常都变成一句人话，而不是抛给用户。
+
+        卡片展示的是**这个会话看到的她**：私聊是各自的，群聊是共用的。
+        """
         try:
-            return renderer(self._card_context(_now()))
+            key, state = self._registry_for_umo(
+                self._safe_umo(event), user_id=self._sender_of(event)
+            )
+            with self._active_state(state, key):
+                return renderer(self._card_context(_now()))
         except Exception as exc:  # noqa: BLE001
             logger.exception(f"[{PLUGIN_NAME}] 渲染卡片失败")
             return f"卡片渲染失败：{type(exc).__name__}: {exc}"
@@ -1651,17 +1835,24 @@ class LifeFrequencyPlugin(Star):
         sec = CA.section(self.conf, "prompt")
         if self.dry_run or not CA.flag(sec, "inject_enabled", True):
             return
+        if not self._enabled_for(self._safe_umo(event)):
+            return
         now = _now()
         if event.is_at_or_wake_command and not event.is_private_chat():
             self._note_at_wake(event, now)
-        try:
-            digest = R.life_digest(self._card_context(now))
-        except Exception:  # noqa: BLE001
-            logger.exception(f"[{PLUGIN_NAME}] 生成生活摘要失败")
-            return
-        max_chars = max(0, CA.integer(sec, "max_chars", 600))
-        if max_chars and len(digest) > max_chars:
-            digest = digest[:max_chars].rstrip()
+        # 注入的必须是**这个会话看到的她**：私聊是各自的，群聊是共用的。
+        key, state = self._registry_for_umo(
+            self._safe_umo(event), user_id=self._sender_of(event)
+        )
+        with self._active_state(state, key):
+            try:
+                digest = R.life_digest(self._card_context(now))
+            except Exception:  # noqa: BLE001
+                logger.exception(f"[{PLUGIN_NAME}] 生成生活摘要失败")
+                return
+            max_chars = max(0, CA.integer(sec, "max_chars", 600))
+            if max_chars and len(digest) > max_chars:
+                digest = digest[:max_chars].rstrip()
         req.system_prompt = f"{req.system_prompt or ''}\n\n{digest}\n"
 
     def _life_system_prompt(self, now: float) -> str:

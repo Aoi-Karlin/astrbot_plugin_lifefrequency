@@ -5,10 +5,16 @@
     "hint": "总开关。关闭后不跑生活循环、不拦截、不主动开口，但 /生活 指令仍可查看最后状态。",
     "items": {
       "enabled": {
-        "description": "启用生活频率",
+        "description": "群聊启用",
         "type": "bool",
         "default": true,
-        "hint": "关掉后她会像普通 AstrBot 一样回复；状态文件保留，重新开启后继续。"
+        "hint": "群聊总开关。关掉后群里完全不介入：不拦截、不改提示词、不主动开口。私聊不受影响。"
+      },
+      "enabled_private": {
+        "description": "私聊启用",
+        "type": "bool",
+        "default": true,
+        "hint": "私聊总开关。关掉后私聊里完全不介入。两边都关才会停后台循环。"
       }
     }
   },
@@ -989,6 +995,17 @@
         "description": "启用主动开口",
         "type": "bool",
         "default": false
+      },
+      "active_hours": {
+        "description": "私聊状态的活跃期（小时）",
+        "type": "int",
+        "default": 24,
+        "slider": {
+          "min": 1,
+          "max": 720,
+          "step": 1
+        },
+        "hint": "私聊每人一套独立生活状态；只有这么久内说过话的私聊才会花 token 问模型在干嘛，其余只用时段表推进。"
       },
       "provider_id": {
         "description": "主动开口模型",
