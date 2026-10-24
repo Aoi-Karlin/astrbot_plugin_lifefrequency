@@ -62,7 +62,11 @@ SKIP_REASON_LABELS: dict[str, str] = {
 class ProactiveConfig:
     """主动开口的全套可调参数。"""
 
+    #: 群聊主动开口开关。
     enabled: bool = False
+    #: 私聊主动开口开关。与 ``enabled``（群聊）**分开控制**：可以只在私聊主动，
+    #: 也可以只在群里主动；两个都关才是完全不主动开口。
+    enabled_private: bool = False
     score_threshold: float = 0.45
     min_interval_minutes: int = 180
     recent_user_silence_minutes: int = 30
@@ -87,6 +91,16 @@ class ProactiveConfig:
 
     def quiet(self, now_minutes: int) -> bool:
         return any(in_window(now_minutes, window) for window in self.quiet_hours)
+
+    def enabled_for(self, private_chat: bool) -> bool:
+        """这个会话类型是否允许主动开口（群聊看 ``enabled``，私聊看 ``enabled_private``）。"""
+
+        return self.enabled_private if private_chat else self.enabled
+
+    def any_enabled(self) -> bool:
+        """是否至少有一边开着。两边都关时整条主动开口链路可以整体跳过。"""
+
+        return self.enabled or self.enabled_private
 
 
 @dataclass(frozen=True)
@@ -246,7 +260,7 @@ def decide(
     （G1 仅私聊启用；群聊与判不出类型的会话一律维持现有硬闸）。
     """
 
-    if not config.enabled:
+    if not config.enabled_for(private_chat):
         return ProactiveDecision(False, REASON_DISABLED)
 
     if activity == SLEEP:

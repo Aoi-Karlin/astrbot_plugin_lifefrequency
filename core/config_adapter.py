@@ -439,6 +439,7 @@ def proactive_config(
     sec = section(config, "proactive")
     return ProactiveConfig(
         enabled=flag(sec, "enabled", False),
+        enabled_private=flag(sec, "enabled_private", False),
         score_threshold=num(sec, "score_threshold", 0.45),
         min_interval_minutes=max(0, integer(sec, "min_interval_minutes", 180)),
         recent_user_silence_minutes=max(0, integer(sec, "recent_user_silence_minutes", 30)),
