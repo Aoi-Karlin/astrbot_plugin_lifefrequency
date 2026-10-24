@@ -992,9 +992,16 @@
     "hint": "她按自己的意愿在群里先说话，而不是等别人 @。默认关闭。",
     "items": {
       "enabled": {
-        "description": "启用主动开口",
+        "description": "群聊启用主动开口",
         "type": "bool",
-        "default": false
+        "default": false,
+        "hint": "只影响群聊。想让它私聊主动找你就打开下面那个「私聊启用主动开口」。两个都关 = 完全不主动开口。"
+      },
+      "enabled_private": {
+        "description": "私聊启用主动开口",
+        "type": "bool",
+        "default": false,
+        "hint": "只影响私聊。与群聊开关互相独立，可以只在私聊主动、也可以只在群里主动。"
       },
       "active_hours": {
         "description": "私聊状态的活跃期（小时）",
@@ -1046,6 +1053,12 @@
         "type": "int",
         "default": 10,
         "hint": "摘要会丢语气和细节，留几条原话当参照。填 0 关闭。"
+      },
+      "prompt_template": {
+        "description": "自定义提示词（整体替换）",
+        "type": "text",
+        "default": "",
+        "hint": "留空 = 用内置模板。填了就**整体替换**内置的要求段落。可用占位符：{material} 素材正文；{intent} 开口的理由；{context} 对话上下文整段；{activity} 她在做什么；{emotion} 情绪 7.3/10；{energy} 体力 3.1/10；{mood} 情绪词；{energy_word} 体力词；{health} 健康状况；{time} 当前时间；{date} 当前日期；{gap} 距上次搭话；{persona} 人设；{name} 她的名字。写错的占位符会原样保留并记一条警告，不会让这次开口失败。"
       },
       "score_threshold": {
         "description": "开口分数阈值",

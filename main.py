@@ -53,6 +53,7 @@ from .core import life_gate as G
 from .core import life_context as CX
 from .core import life_memory as M
 from .core import life_proactive as P
+from .core import life_prompt as PL
 from .core import life_proactive_test as PT
 from .core import life_registry as REG
 from .core import life_sim as S
@@ -1040,9 +1041,13 @@ class LifeFrequencyPlugin(Star):
     # ------------------------------------------------------------ 主动开口
 
     async def _maybe_proactive(self, now: float) -> None:
-        """按评分与硬闸决定是否主动开一次话（``proactive.enabled`` 默认关）。"""
+        """按评分与硬闸决定是否主动开一次话。
+
+        群聊与私聊是**两个独立开关**（``proactive.enabled`` / ``enabled_private``），
+        具体某个会话能不能开口由 ``P.decide`` 里的 ``enabled_for`` 判定。
+        """
         config = self.proactive_config
-        if self.dry_run or not config.enabled:
+        if self.dry_run or not config.any_enabled():
             return
         sec = CA.section(self.conf, "proactive")
         scope_mode, targets = CA.scope_config(
@@ -1261,6 +1266,55 @@ class LifeFrequencyPlugin(Star):
         except Exception:  # noqa: BLE001
             return ""
 
+    def _proactive_prompt(
+        self,
+        *,
+        material_text: str,
+        decision: P.ProactiveDecision,
+        bundle: CX.ContextBundle,
+        now: float,
+    ) -> str:
+        """拼主动开口的提示词：优先用用户模板，留空则用内置默认模板。
+
+        模板里的 ``{占位符}`` 见 ``core/life_prompt.PLACEHOLDER_HELP``。
+        未知占位符原样保留（不会抛异常），并在首次使用时记一条警告。
+        """
+        sec = CA.section(self.conf, "proactive")
+        template = CA.text(sec, "prompt_template", "").strip()
+        if not template:
+            template = PL.DEFAULT_TEMPLATE
+
+        unknown = PL.unknown_placeholders(template, PL.PLACEHOLDER_HELP)
+        if unknown:
+            self._warn(
+                f"proactive_template:{','.join(unknown)}",
+                f"主动开口模板里有不认识的占位符：{', '.join(unknown)}"
+                f"（可用：{', '.join(PL.PLACEHOLDER_HELP)}）",
+            )
+
+        local = S.local_datetime(now, self.sim_config.tz_offset_minutes)
+        context_block = ""
+        if bundle.available:
+            context_block = f"{bundle.as_prompt_block()}\n"
+
+        values = {
+            "material": material_text,
+            "intent": decision.intent or "主动关心一下",
+            "context": context_block,
+            "activity": R.activity_label(self.state.activity),
+            "emotion": f"{float(self.state.emotion):.1f}/10",
+            "energy": f"{float(self.state.energy):.1f}/10",
+            "mood": M.mood_word(float(self.state.emotion)),
+            "energy_word": M.energy_word(float(self.state.energy)),
+            "health": S.health_label(self.state, now, self.sim_config),
+            "time": f"{local.hour:02d}:{local.minute:02d}",
+            "date": f"{local.month}月{local.day}日",
+            "gap": getattr(bundle, "gap_text", "") or "",
+            "persona": self._persona_text(),
+            "name": self._bot_name(),
+        }
+        return PL.render(template, values)
+
     async def _send_proactive_detailed(
         self, umo: str, decision: P.ProactiveDecision, now: float
     ) -> tuple[bool, str]:
@@ -1277,29 +1331,9 @@ class LifeFrequencyPlugin(Star):
         bundle = await self._conversation_context(umo, now)
         if bundle.abort:
             return False, bundle.empty_reason or "上下文不可用，按配置放弃这次开口"
-        parts = [
-            f"【想跟对方说的话】{text}",
-            f"【开口的理由】{decision.intent or '主动关心一下'}",
-        ]
-        if bundle.available:
-            parts.append(bundle.as_prompt_block())
-            rule = (
-                "要求：顺着上面这段对话自然接一句，用一两句口语把这句心里话说出来，"
-                "符合人设与此刻的状态；不要重复对方刚说过的话，不要解释这是谁安排的，"
-                "不要用列表，不要提到「素材」「任务」「总结」这类词。"
-            )
-            if bundle.gap_text:
-                rule += (
-                    "「距上次主动搭话」只用来定语气：隔得久可以显得想念，"
-                    "刚说过话就别做久别重逢的样子；不要把时间数字念出来。"
-                )
-            parts.append(rule)
-        else:
-            parts.append(
-                "要求：用一两句口语把这句心里话说出来，符合人设与此刻的状态；"
-                "不要解释这是谁安排的，不要用列表，不要提到「素材」「任务」这类词。"
-            )
-        prompt = "\n".join(parts)
+        prompt = self._proactive_prompt(
+            material_text=text, decision=decision, bundle=bundle, now=now
+        )
         try:
             provider_id = self._default_provider_id("proactive", umo)
             if not provider_id:
@@ -1699,8 +1733,11 @@ class LifeFrequencyPlugin(Star):
             "",
             auto,
         ]
-        if not config.enabled:
-            lines.append("⚠ 主动开口总开关是关的——真实情况下永远不会自动开口。")
+        scope_name = "群聊" if self._umo_is_group(umo) else "私聊"
+        if not config.enabled_for(not self._umo_is_group(umo)):
+            lines.append(
+                f"⚠ {scope_name}的主动开口开关是关的——真实情况下这里永远不会自动开口。"
+            )
         if self.dry_run:
             lines.append("⚠ 当前是演算模式（dry_run），自动触发也不会真的发。")
         if decision.reason_label and not decision.should_send:
@@ -1746,12 +1783,12 @@ class LifeFrequencyPlugin(Star):
                 self._safe_umo(event), user_id=self._sender_of(event)
             )
             with self._active_state(state, key):
-                return renderer(self._card_context(_now()))
+                return renderer(self._card_context(_now(), umo=self._safe_umo(event)))
         except Exception as exc:  # noqa: BLE001
             logger.exception(f"[{PLUGIN_NAME}] 渲染卡片失败")
             return f"卡片渲染失败：{type(exc).__name__}: {exc}"
 
-    def _card_context(self, now: float) -> R.CardContext:
+    def _card_context(self, now: float, *, umo: str = "") -> R.CardContext:
         """把当前状态打包成 ``render`` 需要的上下文。"""
         gate_sec = CA.section(self.conf, "gate")
         economy_sec = CA.section(self.conf, "economy")
@@ -1780,7 +1817,9 @@ class LifeFrequencyPlugin(Star):
             scope_mode=CA.filter_mode(gate_sec),
             target_count=self._scope_hit_count(gate_sec),
             dry_run=self.dry_run,
-            proactive_enabled=self.proactive_config.enabled,
+            proactive_enabled=self.proactive_config.enabled_for(
+                bool(umo) and not self._umo_is_group(umo)
+            ),
             proactive_scope=CA.scope_label(proactive_sec),
             material_ttl_hours=CA.num(events_sec, "material_ttl_hours", 72.0),
             activity_mode=CA.text(CA.section(self.conf, "activity"), "mode", "llm"),

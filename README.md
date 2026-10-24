@@ -227,8 +227,10 @@ P = base_probability × (基础频率 × 倍率)
 
 ## 主动开口
 
-`proactive.enabled` 默认**关闭**。打开后，她会挑一条还没过期的素材（`events` 里
-攒下的念头），在满足全部硬闸时主动发一条消息：
+`proactive.enabled`（群聊）与 `proactive.enabled_private`（私聊）默认都**关闭**，
+而且是**两个独立开关**：可以只在私聊主动、也可以只在群里主动，两个都关才是完全
+不主动开口。打开后，她会挑一条还没过期的素材（`events` 里攒下的念头），
+在满足全部硬闸时主动发一条消息：
 
 - 不在睡觉、体力 ≥ `minimum_energy`、不在 `quiet_hours`
 - 距上次主动 ≥ `min_interval_minutes`（私聊里对方一直不回应会按
@@ -440,7 +442,8 @@ data/plugin_data/astrbot_plugin_lifefrequency/state.json
 | `gate.filter_mode` | `all` | `all` / `whitelist` / `blacklist`（配合 `target_chats`） |
 | `prompt.inject_enabled` | `true` | 把生活摘要注入系统提示词 |
 | `prompt.max_chars` | `600` | 注入长度上限 |
-| `proactive.enabled` | `false` | 主动开口 |
+| `proactive.enabled` | `false` | **群聊**主动开口 |
+| `proactive.enabled_private` | `false` | **私聊**主动开口（与群聊互相独立） |
 | `economy.enabled` | `true` | 经济维度（单价默认按常见价位预填，请改成你自己的） |
 | `activity_llm.provider_id` | 空 | 活动决策用哪个模型（下拉选，留空=跟随当前会话） |
 | `proactive.provider_id` | 空 | 主动开口用哪个模型（下拉选，留空=跟随当前会话） |
@@ -448,12 +451,55 @@ data/plugin_data/astrbot_plugin_lifefrequency/state.json
 | `proactive.summary_provider_id` | 空 | 总结用的模型，建议选便宜的小模型。**留空就不总结**，不会偷偷多花一次钱 |
 | `proactive.summary_on_fail` | `skip` | 总结失败（超时/报错/返回空）时：`skip` 照样开口，`block` 放弃这次开口 |
 | `proactive.context_messages` | 10 | 另外附带最近几条**原话**当参照（摘要会丢语气和细节）。填 0 关闭 |
+| `proactive.prompt_template` | 空 | 自定义主动开口的提示词，**整体替换**内置要求段。留空用内置模板。见下方说明 |
 | `memory.enabled` | `false` | 与 LivingMemory 长期记忆联动 |
 | `memory.record_activity` | `true` | 记录她换活动（写全局 `livingmemory:life`） |
 | `memory.record_group_events` | `false` | 记录群内对话（写进该群自己的记忆） |
 
 改完配置在 WebUI 里保存即可（会触发插件重载）；`tick_seconds`、
 `sleep_window` 这类结构性参数需要重载才生效。
+
+---
+
+## 自定义主动开口的提示词
+
+觉得她主动搭话"傻了吧唧的"，可以自己写提示词。填在
+**主动开口 → 自定义提示词（整体替换）**（`proactive.prompt_template`）。
+
+填了之后**整段替换**内置的那些要求，完全由你说了算。留空则用内置模板。
+
+### 可用占位符
+
+| 占位符 | 含义 |
+| --- | --- |
+| `{material}` | 素材正文（她心里冒出来的那句话） |
+| `{intent}` | 这次开口的理由 |
+| `{context}` | 对话上下文整段（含总结与最近几条原话；没上下文时为空） |
+| `{activity}` | 她此刻在做什么 |
+| `{emotion}` | 当前情绪，形如 `7.3/10` |
+| `{energy}` | 当前体力，形如 `3.1/10` |
+| `{mood}` | 情绪词，如「心情不错」 |
+| `{energy_word}` | 体力词，如「有点累」 |
+| `{health}` | 健康状况，如「健康」「感冒」 |
+| `{time}` / `{date}` | 当前时间（`21:05`）/ 日期（`10月21日`） |
+| `{gap}` | 距上次搭话多久，如「约 5 小时」 |
+| `{persona}` / `{name}` | 人设文本 / 她的名字 |
+
+### 几点要注意
+
+- 占位符**写错不会报错也不会失败**：它会原样留在提示词里，日志里记一条警告，
+  你一眼就能看出拼错了；
+- 模板里的其他花括号（比如想让它输出 JSON `{"a": 1}`）会**原样保留**，不会被吞；
+- 想完全不要上下文，就别在模板里写 `{context}`——它不会自己塞进去。
+
+### 例子：让她只说一句话，别抒情
+
+```
+【心里话】{material}
+【为什么想说】{intent}
+{context}你正在{activity}，{mood}。就用一句话把上面那句心里话说出来，像发消息那样，
+可以带点口语。不要抒情，不要排比，不要感叹号，不要解释，不超过三十个字。
+```
 
 ---
 
