@@ -521,21 +521,6 @@ data/plugin_data/astrbot_plugin_lifefrequency/state.json
 
 ---
 
-## 开发与测试
-
-`core/` 里是**纯模拟层**：不碰网络、不碰数据库、不依赖 AstrBot，可以直接测。
-`main.py` 只是把它接到 AstrBot 上的薄适配层。
-
-```bash
-cd astrbot_plugin_lifefrequency
-python -m pytest tests -q
-```
-
-覆盖：活动决策与强制层、作息班表、倍率因子、事件素材、回复闸门、经济折算、
-主动开口、配置接线。测试不需要安装 AstrBot。
-
----
-
 ## 许可
 
-MIT，见 `LICENSE`。原始设计与实现 © orge-8（[life-frequency](https://github.com/orge-8/life-frequency)）。
+本项目整体遵循 AGPLv3 协议，包含源自 orge-8 的 MIT 协议代码。原始设计与实现 © orge-8（[life-frequency](https://github.com/orge-8/life-frequency)）。
